@@ -244,3 +244,77 @@ class TestCase(unittest.TestCase):
         except Exception:
             span = self.otel.get_span_named("execute_tool somefunction")
             self.assertEqual(span.attributes["error.type"], "Exception")
+
+    def test_parallel_tool_calls_share_parent_trace(self):
+        # Regression for #38: an agent runs wrapped tools concurrently in a
+        # ThreadPoolExecutor. Worker threads do not inherit contextvars, so
+        # without context propagation each tool span starts its own root trace
+        # instead of joining the active agent span's trace.
+        import concurrent.futures
+
+        from opentelemetry.trace import get_tracer_provider
+
+        tracer = get_tracer_provider().get_tracer("test-#38")
+
+        def get_weather():
+            pass
+
+        def get_stock():
+            pass
+
+        with tracer.start_as_current_span("invoke_agent") as parent:
+            parent_trace_id = parent.get_span_context().trace_id
+            wrapped_weather = self.wrap(get_weather)
+            wrapped_stock = self.wrap(get_stock)
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=2
+            ) as executor:
+                futures = [
+                    executor.submit(wrapped_weather),
+                    executor.submit(wrapped_stock),
+                ]
+                for future in futures:
+                    future.result()
+
+        weather_span = self.otel.get_span_named("execute_tool get_weather")
+        stock_span = self.otel.get_span_named("execute_tool get_stock")
+        # Both tool spans must belong to the agent's trace, not new roots.
+        self.assertEqual(
+            weather_span.context.trace_id,
+            parent_trace_id,
+            "get_weather tool span started a new trace (context lost across "
+            "the executor worker)",
+        )
+        self.assertEqual(
+            stock_span.context.trace_id,
+            parent_trace_id,
+            "get_stock tool span started a new trace (context lost across "
+            "the executor worker)",
+        )
+
+    def test_run_in_executor_tool_call_shares_parent_trace(self):
+        # Regression for #38 via the asyncio.run_in_executor path named in the
+        # issue: the coroutine offloads a sync tool to the default executor.
+        from opentelemetry.trace import get_tracer_provider
+
+        tracer = get_tracer_provider().get_tracer("test-#38-async")
+
+        def get_weather():
+            pass
+
+        async def drive():
+            loop = asyncio.get_event_loop()
+            wrapped_weather = self.wrap(get_weather)
+            await loop.run_in_executor(None, wrapped_weather)
+
+        with tracer.start_as_current_span("invoke_agent") as parent:
+            parent_trace_id = parent.get_span_context().trace_id
+            asyncio.run(drive())
+
+        weather_span = self.otel.get_span_named("execute_tool get_weather")
+        self.assertEqual(
+            weather_span.context.trace_id,
+            parent_trace_id,
+            "run_in_executor tool span started a new trace (context lost "
+            "across the executor worker)",
+        )

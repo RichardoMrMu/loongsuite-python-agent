@@ -15,6 +15,7 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import contextvars
 import functools
 import inspect
 import json
@@ -27,6 +28,8 @@ from google.genai.types import (
     ToolOrDict,
 )
 
+from opentelemetry import context as otel_context
+from opentelemetry.trace import INVALID_SPAN, get_current_span
 from opentelemetry.util.genai import hook_advice
 
 from ._compat import TelemetryHandler, ToolInvocation
@@ -133,20 +136,53 @@ def _fail_tool_advice(
     state.invocation.fail(error)
 
 
+def _capture_parent_context() -> Optional[otel_context.Context]:
+    """Snapshot the OTel context at tool-wrapping time when it carries a span.
+
+    ``wrapped_tool`` runs while the agent/LLM span is active (see
+    ``generate_content._wrapped_config_with_tools``). The wrapped tool itself,
+    however, is executed by the Google GenAI SDK's automatic function calling
+    -- and by agent frameworks -- inside a ``ThreadPoolExecutor`` /
+    ``run_in_executor`` worker. Worker threads do not inherit ``contextvars``,
+    so ``start_execute_tool`` in the worker sees an empty context and parents
+    every tool span to nothing, fragmenting one logical trace into several
+    (issue #38).
+
+    Capturing the context here lets each tool call re-attach it before the
+    invocation span is created, so the tool span becomes a child of the span
+    that was active where the tool was wrapped. Returns ``None`` when no span
+    is active, so normal single-threaded execution is left untouched.
+    """
+    if get_current_span(otel_context.get_current()) is INVALID_SPAN:
+        return None
+    return otel_context.get_current()
+
+
 def _wrap_tool_function(
     tool_function: ToolFunction,
     telemetry_handler: TelemetryHandler,
 ):
+    parent_context = _capture_parent_context()
+
     if inspect.iscoroutinefunction(tool_function):
 
         @functools.wraps(tool_function)
         async def wrapped_function(*args, **kwargs):
-            state = _prepare_tool_advice(
-                tool_function,
-                telemetry_handler,
-                args,
-                kwargs,
+            token = (
+                otel_context.attach(parent_context)
+                if parent_context is not None
+                else None
             )
+            try:
+                state = _prepare_tool_advice(
+                    tool_function,
+                    telemetry_handler,
+                    args,
+                    kwargs,
+                )
+            finally:
+                if token is not None:
+                    otel_context.detach(token)
             try:
                 result = await tool_function(*args, **kwargs)
             except BaseException as error:
@@ -160,12 +196,21 @@ def _wrap_tool_function(
 
         @functools.wraps(tool_function)
         def wrapped_function(*args, **kwargs):
-            state = _prepare_tool_advice(
-                tool_function,
-                telemetry_handler,
-                args,
-                kwargs,
+            token = (
+                otel_context.attach(parent_context)
+                if parent_context is not None
+                else None
             )
+            try:
+                state = _prepare_tool_advice(
+                    tool_function,
+                    telemetry_handler,
+                    args,
+                    kwargs,
+                )
+            finally:
+                if token is not None:
+                    otel_context.detach(token)
             try:
                 result = tool_function(*args, **kwargs)
             except BaseException as error:

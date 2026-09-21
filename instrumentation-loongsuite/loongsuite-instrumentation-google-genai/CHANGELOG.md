@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Propagate the active OpenTelemetry context into wrapped tool functions so
+  automatic function calls executed in a ``ThreadPoolExecutor`` /
+  ``run_in_executor`` worker attach to the agent trace instead of starting a
+  new root trace (issue #38).
+
 ## Version 0.9.0 (2026-09-07)
 
 ### Added

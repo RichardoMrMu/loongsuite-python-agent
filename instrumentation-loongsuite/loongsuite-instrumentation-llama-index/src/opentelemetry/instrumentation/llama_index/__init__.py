@@ -151,7 +151,12 @@ def _classify(prefix: str) -> tuple:
     if "embedding" in method or "embed" in method:
         return _SPAN_KIND_EMBEDDING, _OP_EMBEDDING
     # LLM calls
-    if method in ("chat", "achat", "complete", "acomplete") or method.startswith(
+    if method in (
+        "chat",
+        "achat",
+        "complete",
+        "acomplete",
+    ) or method.startswith(
         ("stream_chat", "astream_chat", "stream_complete", "astream_complete")
     ):
         # chat/complete invoked on a chat engine or agent is the agent turn.
@@ -457,7 +462,13 @@ def _build_event_handler(span_handler):
                     span.set_attribute(
                         _GEN_AI_INPUT_MESSAGES,
                         _messages_to_json(
-                            [type("M", (), {"role": "user", "content": prompt})()]
+                            [
+                                type(
+                                    "M",
+                                    (),
+                                    {"role": "user", "content": prompt},
+                                )()
+                            ]
                         )
                         or "",
                     )

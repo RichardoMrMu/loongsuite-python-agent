@@ -30,11 +30,10 @@ from opentelemetry.instrumentation.llama_index import (
     _GEN_AI_SPAN_KIND,
     _SPAN_KIND_EMBEDDING,
     _SPAN_KIND_LLM,
+    LlamaIndexInstrumentor,
     _classify,
     _span_id_prefix,
-    LlamaIndexInstrumentor,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

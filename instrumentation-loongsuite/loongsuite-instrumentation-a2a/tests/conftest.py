@@ -37,13 +37,12 @@ def pytest_configure(config: pytest.Config):
     os.environ["OTEL_SEMCONV_STABILITY_OPT_IN"] = "gen_ai_latest_experimental"
 
 
+from opentelemetry.instrumentation.a2a import A2AInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
-
-from opentelemetry.instrumentation.a2a import A2AInstrumentor
 
 
 @pytest.fixture(scope="function", name="span_exporter")

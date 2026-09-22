@@ -65,8 +65,8 @@ from typing import Any, Collection, Optional
 from wrapt import wrap_function_wrapper
 
 from opentelemetry import trace as trace_api
-from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.a2a.package import _instruments
+from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.utils import unwrap
 from opentelemetry.trace import SpanKind, Status, StatusCode
 
@@ -128,7 +128,9 @@ class _ExecuteWrapper:
 
     async def __call__(self, wrapped, instance, args, kwargs):
         context = args[0] if args else kwargs.get("context")
-        agent_name = type(instance).__name__ if instance is not None else _AGENT_NAME
+        agent_name = (
+            type(instance).__name__ if instance is not None else _AGENT_NAME
+        )
 
         with self._tracer.start_as_current_span(
             f"{_OP_INVOKE_AGENT} {_AGENT_NAME}",

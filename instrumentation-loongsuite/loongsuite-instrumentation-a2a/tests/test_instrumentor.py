@@ -34,7 +34,6 @@ from opentelemetry.instrumentation.a2a import (
     A2AInstrumentor,
 )
 
-
 # ---------------------------------------------------------------------------
 # Executor stubs (real a2a AgentExecutor subclasses)
 # ---------------------------------------------------------------------------
@@ -75,7 +74,9 @@ def _make_executor_cls(inner_tracer_provider=None):
 class _FakeContext:
     """Minimal RequestContext-like object."""
 
-    def __init__(self, user_input="hello", context_id="ctx-1", task_id="task-1"):
+    def __init__(
+        self, user_input="hello", context_id="ctx-1", task_id="task-1"
+    ):
         self._user_input = user_input
         self.context_id = context_id
         self.task_id = task_id
@@ -128,7 +129,9 @@ async def test_green_agent_span_existing_subclass(instrument, span_exporter):
 
 
 @pytest.mark.asyncio
-async def test_green_inner_work_nests_under_agent(instrument, span_exporter, tracer_provider):
+async def test_green_inner_work_nests_under_agent(
+    instrument, span_exporter, tracer_provider
+):
     # Route the executor's own child span to the same exporter so the nesting
     # relationship is observable; nesting itself is via context propagation.
     ExecCls = _make_executor_cls(inner_tracer_provider=tracer_provider)

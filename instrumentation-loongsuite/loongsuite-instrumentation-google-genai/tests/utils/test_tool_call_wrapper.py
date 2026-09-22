@@ -16,6 +16,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import concurrent.futures
 import json
 import unittest
 from unittest.mock import patch
@@ -250,10 +251,6 @@ class TestCase(unittest.TestCase):
         # ThreadPoolExecutor. Worker threads do not inherit contextvars, so
         # without context propagation each tool span starts its own root trace
         # instead of joining the active agent span's trace.
-        import concurrent.futures
-
-        from opentelemetry.trace import get_tracer_provider
-
         tracer = get_tracer_provider().get_tracer("test-#38")
 
         def get_weather():
@@ -295,8 +292,6 @@ class TestCase(unittest.TestCase):
     def test_run_in_executor_tool_call_shares_parent_trace(self):
         # Regression for #38 via the asyncio.run_in_executor path named in the
         # issue: the coroutine offloads a sync tool to the default executor.
-        from opentelemetry.trace import get_tracer_provider
-
         tracer = get_tracer_provider().get_tracer("test-#38-async")
 
         def get_weather():

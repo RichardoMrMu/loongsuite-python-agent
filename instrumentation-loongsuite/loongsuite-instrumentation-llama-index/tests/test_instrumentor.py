@@ -275,11 +275,15 @@ def test_uninstrument_drains_open_spans(span_exporter, tracer_provider):
     from llama_index.core.instrumentation import get_dispatcher
 
     instrumentor = LlamaIndexInstrumentor()
-    instrumentor.instrument(tracer_provider=tracer_provider, skip_dep_check=True)
+    instrumentor.instrument(
+        tracer_provider=tracer_provider, skip_dep_check=True
+    )
 
     dispatcher = get_dispatcher()
     # Manually open a span through the dispatcher and DO NOT close it.
-    dispatcher.span_enter(id_="ManualThing.run-abc", bound_args=None, instance=None)
+    dispatcher.span_enter(
+        id_="ManualThing.run-abc", bound_args=None, instance=None
+    )
     assert span_exporter.get_finished_spans() == (), "span ended too early"
 
     # Uninstrument while that span is still open: it must be drained (ended).

@@ -28,8 +28,11 @@ from opentelemetry.instrumentation.llama_index import (
     _GEN_AI_FRAMEWORK,
     _GEN_AI_OPERATION_NAME,
     _GEN_AI_SPAN_KIND,
+    _SPAN_KIND_AGENT,
+    _SPAN_KIND_CHAIN,
     _SPAN_KIND_EMBEDDING,
     _SPAN_KIND_LLM,
+    _SPAN_KIND_TOOL,
     LlamaIndexInstrumentor,
     _classify,
     _span_id_prefix,
@@ -76,11 +79,35 @@ def test_span_id_prefix_strips_uuid():
         ("CompactAndRefine.synthesize", "TASK"),
         ("RetrieverQueryEngine.query", "CHAIN"),
         ("ReActAgent.run", "AGENT"),
+        # #273: agent-internal machinery must NOT inherit AGENT from the
+        # class name -- only a genuine agent invocation (run/chat) is AGENT.
+        ("FunctionAgent.call_tool", _SPAN_KIND_TOOL),
+        ("ReActAgent.call_tool", _SPAN_KIND_TOOL),
+        ("FunctionAgent.take_step", _SPAN_KIND_CHAIN),
+        ("FunctionAgent.setup_agent", _SPAN_KIND_CHAIN),
+        ("FunctionAgent.finalize", _SPAN_KIND_CHAIN),
+        ("ReActAgent.handle_tool_call_results", _SPAN_KIND_CHAIN),
+        # Copilot: async/streaming structured prediction are LLM calls.
+        ("OpenAI.astructured_predict", _SPAN_KIND_LLM),
+        ("OpenAI.stream_structured_predict", _SPAN_KIND_LLM),
+        ("OpenAI.astream_structured_predict", _SPAN_KIND_LLM),
     ],
 )
 def test_classify(prefix, expected_kind):
     kind, _op = _classify(prefix)
     assert kind == expected_kind
+
+
+def test_agent_internal_methods_are_not_agent_spans():
+    # Direct guard for the #273 review: a class named *Agent* must not turn
+    # setup/parse/call_tool into AGENT spans. call_tool is TOOL; the rest are
+    # internal steps (CHAIN), and only run/chat is the AGENT invocation.
+    assert _classify("FunctionAgent.run")[0] == _SPAN_KIND_AGENT
+    assert _classify("FunctionAgent.call_tool")[0] == _SPAN_KIND_TOOL
+    for internal in ("take_step", "setup_agent", "init_run", "finalize"):
+        kind, _op = _classify(f"FunctionAgent.{internal}")
+        assert kind != _SPAN_KIND_AGENT, internal
+        assert kind == _SPAN_KIND_CHAIN, internal
 
 
 # ---------------------------------------------------------------------------
@@ -132,13 +159,13 @@ def test_green_chat_complete_share_trace_and_nest(instrument, span_exporter):
     trace_ids = {s.context.trace_id for s in spans}
     assert len(trace_ids) == 1, f"spans split across traces: {trace_ids}"
 
-    by_span_id = {s.context.span_id: s for s in spans}
     chat = next(s for s in spans if s.name.endswith(".chat"))
     complete = next(s for s in spans if s.name.endswith(".complete"))
 
-    # complete's parent chain must reach the chat span within the same trace.
+    # Assert the EXACT parent id, not just 'some exported span': a broken
+    # parent_span_id mapping must not be able to satisfy this test.
     assert complete.parent is not None
-    assert complete.parent.span_id in by_span_id
+    assert complete.parent.span_id == chat.context.span_id
     assert complete.context.trace_id == chat.context.trace_id
 
 
@@ -195,3 +222,69 @@ def test_instrument_is_idempotent_on_uninstrument(
     instrumentor.uninstrument()
     # second uninstrument must not raise
     instrumentor.uninstrument()
+
+
+# ---------------------------------------------------------------------------
+# Content capture is governed by the shared GenAI util's switch (#273)
+# ---------------------------------------------------------------------------
+
+
+def _chat_span(span_exporter):
+    return next(
+        s
+        for s in span_exporter.get_finished_spans()
+        if s.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_LLM
+    )
+
+
+def test_content_captured_when_shared_util_enables_span_content(
+    instrument, span_exporter, monkeypatch
+):
+    # SPAN_ONLY via the standard shared-util env => input messages on the span.
+    monkeypatch.setenv(
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY"
+    )
+    _chat_once(_mock_llm())
+    span = _chat_span(span_exporter)
+    assert "gen_ai.input.messages" in span.attributes
+
+
+def test_content_suppressed_when_shared_util_disables_content(
+    instrument, span_exporter, monkeypatch
+):
+    # NO_CONTENT (the shared-util default) => structural span but no messages.
+    monkeypatch.setenv(
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "NO_CONTENT"
+    )
+    _chat_once(_mock_llm())
+    span = _chat_span(span_exporter)
+    assert "gen_ai.input.messages" not in span.attributes
+    assert "gen_ai.output.messages" not in span.attributes
+    # the structural span itself is still emitted
+    assert span.attributes.get(_GEN_AI_FRAMEWORK) == "llama_index"
+
+
+# ---------------------------------------------------------------------------
+# Uninstrument must not strand spans that were open when it ran (Copilot #2)
+# ---------------------------------------------------------------------------
+
+
+def test_uninstrument_drains_open_spans(span_exporter, tracer_provider):
+    """A span left open at uninstrument time must still be ended (exported),
+    not stranded because the handler was detached before it closed."""
+    from llama_index.core.instrumentation import get_dispatcher
+
+    instrumentor = LlamaIndexInstrumentor()
+    instrumentor.instrument(tracer_provider=tracer_provider, skip_dep_check=True)
+
+    dispatcher = get_dispatcher()
+    # Manually open a span through the dispatcher and DO NOT close it.
+    dispatcher.span_enter(id_="ManualThing.run-abc", bound_args=None, instance=None)
+    assert span_exporter.get_finished_spans() == (), "span ended too early"
+
+    # Uninstrument while that span is still open: it must be drained (ended).
+    instrumentor.uninstrument()
+    ended = span_exporter.get_finished_spans()
+    assert any(s.name == "ManualThing.run" for s in ended), (
+        f"open span was stranded, not drained: {[s.name for s in ended]}"
+    )

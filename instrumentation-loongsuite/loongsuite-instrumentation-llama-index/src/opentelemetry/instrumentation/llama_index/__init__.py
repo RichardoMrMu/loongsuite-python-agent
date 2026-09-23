@@ -56,15 +56,17 @@ onto the currently-open OTel span as gen-ai attributes.
 
 Content capture
 ---------------
-Message text is captured on span attributes. Set the environment variable
-``OTEL_INSTRUMENTATION_LLAMA_INDEX_CAPTURE_CONTENT=false`` to suppress
-``gen_ai.input.messages`` / ``gen_ai.output.messages`` while keeping the
-structural spans and token metrics.
+Message text is written onto span attributes only when the shared GenAI
+util's content-capture switch enables it -- set
+``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` to ``SPAN_ONLY`` or
+``SPAN_AND_EVENT`` to record ``gen_ai.input.messages`` /
+``gen_ai.output.messages``; ``NO_CONTENT`` (the default) keeps the
+structural spans and token metrics without message text. This is the same
+control every other loongsuite instrumentation uses.
 """
 
 import json
 import logging
-import os
 import threading
 from typing import Any, Collection, Dict, Optional
 
@@ -73,6 +75,12 @@ from opentelemetry import trace as trace_api
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.llama_index.package import _instruments
 from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.util.genai.extended_semconv.gen_ai_extended_attributes import (
+    GEN_AI_SPAN_KIND,
+    GenAiSpanKindValues,
+)
+from opentelemetry.util.genai.types import ContentCapturingMode
+from opentelemetry.util.genai.utils import get_content_capturing_mode
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +91,7 @@ _FRAMEWORK = "llama_index"
 # Strings inlined to avoid a hard dependency on private aliyun packages that
 # aren't published to PyPI. Values track the ARMS gen-ai semconv, matching the
 # sibling loongsuite instrumentation packages (terminus2, litellm, ...).
-_GEN_AI_SPAN_KIND = "gen_ai.span.kind"
+_GEN_AI_SPAN_KIND = GEN_AI_SPAN_KIND  # shared GenAI-util semconv key
 _GEN_AI_OPERATION_NAME = "gen_ai.operation.name"
 _GEN_AI_FRAMEWORK = "gen_ai.framework"
 _GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
@@ -96,17 +104,24 @@ _GEN_AI_INPUT_MESSAGES = "gen_ai.input.messages"
 _GEN_AI_OUTPUT_MESSAGES = "gen_ai.output.messages"
 
 # ── Span kind values ─────────────────────────────────────────────────────────
-_SPAN_KIND_LLM = "LLM"
-_SPAN_KIND_EMBEDDING = "EMBEDDING"
-_SPAN_KIND_RETRIEVER = "RETRIEVER"
-_SPAN_KIND_RERANKER = "RERANKER"
+# Span-kind literals below are sourced from the shared GenAI util
+# (GenAiSpanKindValues) so this package and the rest of loongsuite speak one
+# span-kind vocabulary. TASK/CHAIN have no shared-util member yet, so they
+# stay local literals until one exists.
+_SPAN_KIND_LLM = GenAiSpanKindValues.LLM.value
+_SPAN_KIND_EMBEDDING = GenAiSpanKindValues.EMBEDDING.value
+_SPAN_KIND_RETRIEVER = GenAiSpanKindValues.RETRIEVER.value
+_SPAN_KIND_RERANKER = GenAiSpanKindValues.RERANKER.value
+_SPAN_KIND_TOOL = GenAiSpanKindValues.TOOL.value
+_SPAN_KIND_AGENT = GenAiSpanKindValues.AGENT.value
 _SPAN_KIND_TASK = "TASK"
 _SPAN_KIND_CHAIN = "CHAIN"
-_SPAN_KIND_AGENT = "AGENT"
 
 # ── Operation-name values ────────────────────────────────────────────────────
 _OP_CHAT = "chat"
 _OP_EMBEDDING = "embedding"
+_OP_EXECUTE_TOOL = "execute_tool"
+_OP_STEP = "step"
 _OP_RETRIEVE = "retrieve"
 _OP_RERANK = "rerank"
 _OP_TASK = "task"
@@ -114,11 +129,25 @@ _OP_CHAIN = "chain"
 _OP_INVOKE_AGENT = "invoke_agent"
 
 # ── Content capture toggle ───────────────────────────────────────────────────
-_CAPTURE_CONTENT_ENV = "OTEL_INSTRUMENTATION_LLAMA_INDEX_CAPTURE_CONTENT"
+# Content-message capture is delegated to the shared GenAI util so it is
+# governed by the same OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT
+# switch (and NO_CONTENT/SPAN_ONLY/EVENT_ONLY/SPAN_AND_EVENT modes) as every
+# other loongsuite instrumentation, rather than a package-specific env var.
+_CONTENT_ON_SPAN_MODES = frozenset(
+    {ContentCapturingMode.SPAN_ONLY, ContentCapturingMode.SPAN_AND_EVENT}
+)
 
 
 def _capture_content() -> bool:
-    return os.getenv(_CAPTURE_CONTENT_ENV, "true").lower() != "false"
+    """True when message content should be written onto spans.
+
+    Reads the shared util's content-capturing mode; unset defaults to no
+    capture there, so callers that want content set the standard env var.
+    """
+    try:
+        return get_content_capturing_mode() in _CONTENT_ON_SPAN_MODES
+    except Exception:  # pragma: no cover - defensive: never break tracing
+        return False
 
 
 def _span_id_prefix(id_: str) -> str:
@@ -147,6 +176,28 @@ def _classify(prefix: str) -> tuple:
     method = lower.rsplit(".", 1)[-1] if "." in lower else lower
 
     # ---- method-first mapping (authoritative) ----
+    # Tool execution: an agent's ``call_tool`` runs the selected tool, so it is a
+    # TOOL span, not an AGENT span -- even though it lives on an ``*Agent`` class.
+    # Checked before everything else so the class name can never override it.
+    if method in ("call_tool", "acall_tool"):
+        return _SPAN_KIND_TOOL, _OP_EXECUTE_TOOL
+    # Internal agent-loop machinery (setup/init/step/finalize/tool-result
+    # handling). These are steps *inside* an agent invocation, not the agent
+    # invocation itself, so they must not inherit AGENT from the class name.
+    if method in (
+        "setup_agent",
+        "init_run",
+        "take_step",
+        "atake_step",
+        "run_step",
+        "arun_step",
+        "_run_step",
+        "finalize",
+        "afinalize",
+        "handle_tool_call_results",
+        "aggregate_tool_results",
+    ):
+        return _SPAN_KIND_CHAIN, _OP_STEP
     # Embedding
     if "embedding" in method or "embed" in method:
         return _SPAN_KIND_EMBEDDING, _OP_EMBEDDING
@@ -163,7 +214,16 @@ def _classify(prefix: str) -> tuple:
         if "agent" in lower or "chatengine" in lower or "chat_engine" in lower:
             return _SPAN_KIND_AGENT, _OP_INVOKE_AGENT
         return _SPAN_KIND_LLM, _OP_CHAT
-    if method in ("predict", "apredict", "structured_predict"):
+    # Structured prediction is an LLM call; include the async and streaming
+    # dispatcher-instrumented variants so they get LLM (not the CHAIN fallback).
+    if method in (
+        "predict",
+        "apredict",
+        "structured_predict",
+        "astructured_predict",
+        "stream_structured_predict",
+        "astream_structured_predict",
+    ):
         return _SPAN_KIND_LLM, _OP_CHAT
     # Query engine (must precede the retriever class-substring fallback so
     # RetrieverQueryEngine.query is a CHAIN, not a RETRIEVER).
@@ -178,11 +238,15 @@ def _classify(prefix: str) -> tuple:
     # Synthesis
     if "synthesize" in method:
         return _SPAN_KIND_TASK, _OP_TASK
-    # Agent / workflow run
+    # Agent / workflow run: the true agent invocation entrypoint.
     if method in ("run", "arun"):
         return _SPAN_KIND_AGENT, _OP_INVOKE_AGENT
 
     # ---- class-name fallback (method was not decisive) ----
+    # NB: no blanket ``"agent" in lower -> AGENT`` here. Only a genuine agent
+    # invocation (handled above via ``run``/``chat`` on an agent) is AGENT; an
+    # unrecognized method on an ``*Agent`` class is an internal step, so it falls
+    # through to CHAIN rather than masquerading as another whole agent turn.
     if "queryengine" in lower or "query_engine" in lower:
         return _SPAN_KIND_CHAIN, _OP_CHAIN
     if "retriever" in lower:
@@ -191,8 +255,6 @@ def _classify(prefix: str) -> tuple:
         return _SPAN_KIND_RERANKER, _OP_RERANK
     if "synthesizer" in lower:
         return _SPAN_KIND_TASK, _OP_TASK
-    if "agent" in lower:
-        return _SPAN_KIND_AGENT, _OP_INVOKE_AGENT
     return _SPAN_KIND_CHAIN, _OP_CHAIN
 
 
@@ -297,6 +359,7 @@ def _build_span_handler(tracer):
             object.__setattr__(self, "_otel_spans", {})
             object.__setattr__(self, "_otel_tokens", {})
             object.__setattr__(self, "_otel_lock", threading.Lock())
+            object.__setattr__(self, "_otel_stopped", False)
 
         # -- helpers -------------------------------------------------------
         def _spans(self) -> Dict[str, Any]:
@@ -311,6 +374,25 @@ def _build_span_handler(tracer):
         def _tracer(self):
             return object.__getattribute__(self, "_otel_tracer")
 
+        def _stopped(self) -> bool:
+            return object.__getattribute__(self, "_otel_stopped")
+
+        def stop_and_drain(self) -> None:
+            """Stop creating new spans and finish any that are still open.
+
+            LlamaIndex only dispatches exit/drop to handlers still attached to
+            the dispatcher, so a handler removed mid-flight would strand every
+            span open when uninstrument ran (their SDK spans and context tokens
+            would never close). Flip the stopped flag first -- so no new spans
+            are created while callers wind down -- then end whatever remains.
+            """
+            object.__setattr__(self, "_otel_stopped", True)
+            spans = self._spans()
+            with self._lock():
+                leftover_ids = list(spans.keys())
+            for id_ in leftover_ids:
+                self._finish(id_)
+
         def class_name(self) -> str:  # pydantic-friendly identity
             return "OtelSpanHandler"
 
@@ -324,6 +406,10 @@ def _build_span_handler(tracer):
             tags: Optional[Dict[str, Any]] = None,
             **kwargs: Any,
         ):
+            if self._stopped():
+                # Uninstrument in progress: create no new spans, but leave
+                # already-open ones for exit/drop to finish.
+                return None
             prefix = _span_id_prefix(id_)
             span_kind, op_name = _classify(prefix)
 
@@ -580,6 +666,13 @@ class LlamaIndexInstrumentor(BaseInstrumentor):
 
             dispatcher = instrumentation.get_dispatcher()
             if self._span_handler is not None:
+                # Close any spans still open BEFORE detaching, so removing the
+                # handler cannot strand them (the dispatcher only routes
+                # exit/drop to still-attached handlers).
+                try:
+                    self._span_handler.stop_and_drain()
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug("Could not drain open spans: %s", e)
                 try:
                     dispatcher.span_handlers = [
                         h

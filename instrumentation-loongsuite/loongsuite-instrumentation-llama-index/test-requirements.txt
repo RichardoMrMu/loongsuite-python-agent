@@ -5,4 +5,5 @@ setuptools
 llama-index-core
 
 -e opentelemetry-instrumentation
+-e util/opentelemetry-util-genai
 -e instrumentation-loongsuite/loongsuite-instrumentation-llama-index

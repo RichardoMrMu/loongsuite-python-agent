@@ -101,7 +101,7 @@ async def test_red_no_agent_span_without_instrumentation(
     ExecCls = _make_executor_cls()
     await _run(ExecCls())
     names = [s.name for s in span_exporter.get_finished_spans()]
-    assert "invoke_agent a2a-agent" not in names, names
+    assert not any(n.startswith("invoke_agent ") for n in names), names
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +124,11 @@ async def test_green_agent_span_existing_subclass(instrument, span_exporter):
     span = agent_spans[0]
     assert span.attributes.get(_GEN_AI_FRAMEWORK) == "a2a"
     assert span.attributes.get(_GEN_AI_OPERATION_NAME) == "invoke_agent"
-    assert span.attributes.get("a2a.context_id") == "ctx-1"
-    assert span.attributes.get("a2a.task_id") == "task-1"
+    assert span.attributes.get("a2a.context.id") == "ctx-1"
+    assert span.attributes.get("a2a.task.id") == "task-1"
+    # Span name uses the concrete executor class, not a constant.
+    assert span.name.startswith("invoke_agent ")
+    assert span.name != "invoke_agent a2a"
 
 
 @pytest.mark.asyncio
@@ -153,7 +156,13 @@ async def test_green_inner_work_nests_under_agent(
 
 
 @pytest.mark.asyncio
-async def test_green_captures_user_input(instrument, span_exporter):
+async def test_green_captures_user_input(
+    instrument, span_exporter, monkeypatch
+):
+    # Content is captured only when the shared util's switch opts in.
+    monkeypatch.setenv(
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY"
+    )
     ExecCls = _make_executor_cls()
     await _run(ExecCls(), context=_FakeContext(user_input="what is 2+2?"))
 
@@ -168,6 +177,25 @@ async def test_green_captures_user_input(instrument, span_exporter):
     assert "what is 2+2?" in msgs
 
 
+@pytest.mark.asyncio
+async def test_content_suppressed_by_default(
+    instrument, span_exporter, monkeypatch
+):
+    # No capture env set -> shared util defaults to NO_CONTENT -> no message text.
+    monkeypatch.delenv(
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", raising=False
+    )
+    ExecCls = _make_executor_cls()
+    await _run(ExecCls(), context=_FakeContext(user_input="secret prompt"))
+
+    agent = next(
+        s
+        for s in span_exporter.get_finished_spans()
+        if s.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_AGENT
+    )
+    assert "gen_ai.input.messages" not in agent.attributes
+
+
 # ---------------------------------------------------------------------------
 # GREEN: AGENT span for a subclass defined AFTER instrument (init_subclass hook)
 # ---------------------------------------------------------------------------
@@ -180,7 +208,7 @@ async def test_green_agent_span_late_subclass(instrument, span_exporter):
     await _run(ExecCls())
 
     names = [s.name for s in span_exporter.get_finished_spans()]
-    assert "invoke_agent a2a-agent" in names, names
+    assert any(n.startswith("invoke_agent ") for n in names), names
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +237,7 @@ async def test_red_uninstrument_stops_agent_span(
     ExecCls2 = _make_executor_cls()
     await _run(ExecCls2())
     names = [s.name for s in span_exporter.get_finished_spans()]
-    assert "invoke_agent a2a-agent" not in names, (
+    assert not any(n.startswith("invoke_agent ") for n in names), (
         f"AGENT span still produced after uninstrument: {names}"
     )
 
@@ -256,3 +284,71 @@ async def test_double_uninstrument_safe(tracer_provider):
     )
     instrumentor.uninstrument()
     instrumentor.uninstrument()
+
+
+# ---------------------------------------------------------------------------
+# Fail-safe: a telemetry failure must never break the agent's execution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_telemetry_failure_does_not_break_execution(
+    instrument, span_exporter
+):
+    # A context whose accessors explode simulates telemetry-side failure; the
+    # wrapped execute must still run to completion and return its result.
+    class _HostileContext:
+        context_id = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+        def get_user_input(self):
+            raise RuntimeError("boom")
+
+    from a2a.server.agent_execution import AgentExecutor
+
+    class _Exec(AgentExecutor):
+        async def execute(self, context, event_queue):
+            return "ok"
+
+        async def cancel(self, context, event_queue):
+            return None
+
+    # Must not raise despite the hostile context attribute access.
+    result = await _Exec().execute(_HostileContext(), object())
+    assert result == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Uninstrument restores AgentExecutor.__init_subclass__ (Copilot findings)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_uninstrument_restores_init_subclass(tracer_provider):
+    from a2a.server.agent_execution import AgentExecutor
+
+    before = AgentExecutor.__dict__.get("__init_subclass__")
+
+    instrumentor = A2AInstrumentor()
+    instrumentor.instrument(
+        tracer_provider=tracer_provider, skip_dep_check=True
+    )
+    # While instrumented, our hook is installed.
+    assert AgentExecutor.__dict__.get("__init_subclass__") is not before
+
+    instrumentor.uninstrument()
+    # Restored to exactly the pre-instrument state (AgentExecutor defines none
+    # of its own, so the attribute is removed and object's default is inherited).
+    after = AgentExecutor.__dict__.get("__init_subclass__")
+    assert after is before
+
+    # A subclass defined now must construct cleanly (no stranded hook).
+    class _Late(AgentExecutor):
+        async def execute(self, context, event_queue):
+            return None
+
+        async def cancel(self, context, event_queue):
+            return None
+
+    assert _Late is not None

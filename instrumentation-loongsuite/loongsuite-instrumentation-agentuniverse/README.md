@@ -4,23 +4,24 @@ OpenTelemetry instrumentation for the
 [agentUniverse](https://github.com/alipay/agentUniverse) multi-agent framework
 (`agentUniverse`).
 
-agentUniverse ships its own OpenTelemetry instrumentors (0.0.18+): one for
-`Agent.run` / `Agent.async_run`, one for the `@trace_llm` decorator and one for
-`@trace_tool`. Each already produces exactly one INTERNAL span per invocation --
-`au.agent.{source}`, `au.llm.{source}`, `au.tool.{source}` -- together with the
-`au.*` metrics, streaming first-token timing, conversation-memory recording,
-token usage aggregation and error handling.
+This is an **independent implementation aligned with the capabilities of
+agentUniverse's own instrumentation**. It does not import, delegate to or patch
+the framework's instrumentors, span-attribute setters, span managers or metric
+recorders. Instead it takes over the three documented wrapper extension points
+of `agentuniverse.base.annotation.trace` -- the same seam the framework's own
+instrumentation uses -- and produces the Agent, LLM and Tool telemetry itself:
 
-This package does **not** create spans and does **not** wrap `Agent.run`,
-`Agent.async_run`, `@trace_llm` or `@trace_tool`. It is a minimal compatibility
-bridge across all three layers: for each one it delegates span creation to the
-native instrumentor and adds the ARMS/LoongSuite gen-ai semantic conventions
-(`gen_ai.*`) to that very same span, so a whole agent call tree -- agent, LLM
-requests, tool calls -- carries one span per layer, each with both namespaces.
+* `au.agent.{source}`, `au.llm.{source}` and `au.tool.{source}` spans
+  (`SpanKind.INTERNAL`), with the same `au.*` attribute set, the same 26 metrics
+  (9 agent, 9 LLM, 8 tool), streaming first-token timing, conversation-memory
+  recording, invocation-chain propagation, token aggregation and error handling
+  the framework's instrumentors emit, and
+* the ARMS/LoongSuite GenAI semantic conventions (`gen_ai.*`) on those same
+  spans, through the shared `ExtendedTelemetryHandler` every LoongSuite
+  instrumentation uses.
 
-Enabling this package next to the native instrumentors, which is the normal
-setup, still yields exactly one span per layer, and one data point per native
-metric.
+One agent call tree therefore carries exactly one span per layer -- agent, LLM
+request, tool call -- each with both the `au.*` and the `gen_ai.*` namespaces.
 
 ## Requirements
 
@@ -33,11 +34,10 @@ that range.
 
 `requires-python` is bounded accordingly (`>=3.10,<3.13`), so the declared
 range, the classifiers and the tox environments all say the same thing. On
-3.13 the `instruments` extra cannot be resolved, and this bridge is inert
-without agentUniverse.
+3.13 the `instruments` extra cannot be resolved, and this instrumentation is
+inert without agentUniverse.
 
-`agentUniverse >= 0.0.19` is declared as a dependency, which implies the
-native instrumentors this bridge delegates to (`0.0.18+`).
+`agentUniverse >= 0.0.19` is declared as the `instruments` extra.
 
 ## Installation
 
@@ -55,16 +55,157 @@ from opentelemetry.instrumentation.agentuniverse import (
 AgentUniverseInstrumentor().instrument()
 ```
 
-One call bridges all three layers. Instrumentation covers every agent, LLM
-method and tool, including classes defined after `instrument()` is called: each
-native instrumentor replaces module-level wrapper globals in
-`agentuniverse.base.annotation.trace` that the `@trace_agent`, `@trace_llm` and
-`@trace_tool` decorators read at call time.
+One call instruments all three layers. Every agent, every `@trace_llm` method
+and every tool is covered, including classes defined after `instrument()` is
+called, because the decorators read the wrapper globals at call time.
 
-The application can also enable the native instrumentors first, in any
-combination, and instrument the bridge afterwards -- or let agentUniverse's own
-`TelemetryManager.init_from_config()` enable all three native instrumentors plus
-this bridge by class path:
+`tracer_provider` and `meter_provider` may be passed to `instrument()`; both
+default to the OTel globals. `uninstrument()` removes the instrumentation
+again.
+
+## What is instrumented
+
+### Agent
+
+| | |
+| --- | --- |
+| Span | `au.agent.{source}`, `SpanKind.INTERNAL` |
+| Attributes | `au.span.kind=agent`, `au.agent.name`, `au.agent.input`, `au.agent.output`, `au.agent.status`, `au.agent.duration`, `au.agent.pair_id`, `au.agent.streaming`, `au.agent.first_token.duration`, `au.agent.error.type`, `au.agent.error.message`, `au.trace.caller_name`, `au.trace.caller_type`, `au.agent.usage.total_tokens/prompt_tokens/completion_tokens/detail_tokens` |
+| Metrics | `agent_calls_total`, `agent_errors_total`, `agent_call_duration`, `agent_first_token_duration`, `agent_total_tokens`, `agent_prompt_tokens`, `agent_completion_tokens`, `agent_cached_tokens`, `agent_reasoning_tokens` |
+| Behaviour | sync and async runs; streaming runs wrap the `output_stream` queue (`queue.Queue`, `queue.SimpleQueue` and `asyncio.Queue`) to time the first token; `ConversationMemoryModule` records the input and the result; the invocation chain carries the agent node; token usage of nested LLM calls is aggregated onto the agent span |
+
+### LLM
+
+| | |
+| --- | --- |
+| Span | `au.llm.{source}`, `SpanKind.INTERNAL` |
+| Attributes | `au.span.kind=llm`, `au.llm.name`, `au.llm.channel_name`, `au.llm.input`, `au.llm.output`, `au.llm.llm_params`, `au.llm.streaming`, `au.llm.duration`, `au.llm.status`, `au.llm.first_token.duration`, `au.llm.error.type`, `au.llm.error.message`, `au.trace.caller_name`, `au.trace.caller_type`, `au.llm.usage.prompt_tokens/completion_tokens/total_tokens/detail_tokens` |
+| Metrics | `llm_calls_total`, `llm_errors_total`, `llm_call_duration`, `llm_first_token_duration`, `llm_total_tokens`, `llm_prompt_tokens`, `llm_completion_tokens`, `llm_cached_tokens`, `llm_reasoning_tokens` |
+| Behaviour | sync and async calls; a streaming call's span stays open until the returned iterator has been consumed, and is finalized exactly once (normal completion, error, or an early `close()` / `aclose()`); the real `LLMOutput.usage` is aggregated onto the parent agent; the `_llm_plugins` extension point of `agentuniverse.base.annotation.trace` is applied before the original call, so application plugins keep working |
+
+### Tool
+
+| | |
+| --- | --- |
+| Span | `au.tool.{source}`, `SpanKind.INTERNAL` |
+| Attributes | `au.span.kind=tool`, `au.tool.name`, `au.tool.input`, `au.tool.output`, `au.tool.duration`, `au.tool.status`, `au.tool.pair_id`, `au.tool.error.type`, `au.tool.error.message`, `au.trace.caller_name`, `au.trace.caller_type`, `au.tool.usage.*` |
+| Metrics | `tool_calls_total`, `tool_errors_total`, `tool_call_duration`, `tool_total_tokens`, `tool_prompt_tokens`, `tool_completion_tokens`, `tool_cached_tokens`, `tool_reasoning_tokens` |
+| Behaviour | sync and async tools; `ConversationMemoryModule` records the input and the output; the invocation chain carries the tool node |
+
+### LoongSuite GenAI conventions
+
+The `gen_ai.*` namespace is written by the shared `ExtendedTelemetryHandler` on
+the very same span. Because the handler normalises span names to its own
+`gen_ai` form, the layer hands it a thin name-preserving proxy: the `au.*`
+span name is kept, while the handler still writes its attributes, records its
+metrics and ends the span.
+
+| Layer | `gen_ai.*` identity and request attributes |
+| --- | --- |
+| Agent | `gen_ai.operation.name=invoke_agent`, `gen_ai.span.kind=AGENT`, `gen_ai.agent.name`, `gen_ai.framework=agentuniverse` |
+| LLM | `gen_ai.operation.name=chat`, `gen_ai.span.kind=LLM`, `gen_ai.request.model`, `gen_ai.provider.name`, `gen_ai.request.temperature` (only when the caller set one), `gen_ai.framework=agentuniverse` |
+| Tool | `gen_ai.operation.name=execute_tool`, `gen_ai.span.kind=TOOL`, `gen_ai.tool.name`, `gen_ai.tool.type=function`, `gen_ai.tool.call.id`, `gen_ai.framework=agentuniverse` |
+
+On top of that the handler writes `gen_ai.usage.input_tokens/output_tokens/
+total_tokens` from the same numbers the `au.*.usage.*` attributes carry,
+`gen_ai.response.time_to_first_token` for agent and LLM calls, the LLM's
+`gen_ai.response.finish_reasons`, the tool call arguments and result, and, with
+content capture on, the conventional
+`gen_ai.input.messages` / `gen_ai.output.messages` /
+`gen_ai.system_instructions`.
+
+## Coexistence with agentUniverse's own instrumentation
+
+`agentUniverse` ships its own OpenTelemetry instrumentors (`AgentInstrumentor`,
+`LLMInstrumentor`, `ToolInstrumentor`), started either directly or through
+`TelemetryManager.init_from_config()`. Both implementations take over the same
+six module-level wrapper globals, so they must not both be active.
+
+This package is written for that: **LoongSuite takes priority while it is
+installed, and the framework's instrumentation is restored afterwards.**
+
+* `instrument()` first snapshots all six extension points
+  (`_agent_wrapper_sync` / `_agent_wrapper_async`, `_llm_wrapper_sync` /
+  `_llm_wrapper_async`, `_tool_wrapper_sync` / `_tool_wrapper_async`) as they
+  are at that moment -- plain framework defaults, or bound methods of a native
+  instrumentor the application already started.
+* It then replaces all six with its own wrappers and never calls the previous
+  wrapper, so no call can be wrapped twice and no second span or metric can be
+  produced. This is what keeps a three-instrumentor application at exactly one
+  span per layer when LoongSuite is added.
+* `uninstrument()` puts the saved objects back, extension point by extension
+  point. If something else replaced a wrapper while LoongSuite was installed,
+  that new state is left untouched instead of being overwritten.
+* The framework's instrumentor objects are never called and their
+  `BaseInstrumentor` state is never modified: LoongSuite only overrides the
+  module-level extension points, reversibly. A native instrumentor the
+  application started stays "instrumented" as far as the framework is
+  concerned and resumes working as soon as LoongSuite restores the wrappers.
+* Installing is transactional. If any extension point cannot be replaced, the
+  wrappers already installed in that attempt are rolled back to the snapshot
+  and the application keeps using the original wrappers -- a partially
+  installed state, which could double-wrap a layer, never survives an install.
+* Instrument and uninstrument are sentinelled, so repeating either is a no-op,
+  and mixing native and LoongSuite instrumentation in either order is covered
+  by tests.
+
+An application that prefers the framework's telemetry can keep using it alone;
+this package adds no telemetry unless it is instrumented.
+
+## Content capture and privacy
+
+Content capture follows the shared GenAI switch, read per call from the same
+configuration every LoongSuite instrumentation reads. An absent or invalid
+value defaults to `NO_CONTENT`, so prompts and results are never exported
+without opt-in:
+
+```bash
+# Record message content on spans (default is NO_CONTENT):
+export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=SPAN_ONLY
+```
+
+| | capture off (default) | capture on (`SPAN_ONLY` / `SPAN_AND_EVENT`) |
+| --- | --- | --- |
+| `au.agent.input/output`, `au.llm.input/output`, `au.tool.input/output` | not written, on any layer | written |
+| `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` | not written | written |
+| structure (identity, caller, timing, status, pairing, usage, errors) and all 26 metrics | unchanged | unchanged |
+
+Capture is all-or-nothing per layer: either the input and the output are both
+on the span, or neither is. `EVENT_ONLY` counts as off for span content,
+because this instrumentation emits no events.
+
+Two attribute families need extra care, so they get the same treatment:
+
+* **`au.llm.llm_params`** may carry prompt-like values. With capture off only
+  the scalar request parameters that cannot hold content (for example
+  `temperature`) are kept; with capture on the whole parameter mapping is
+  written.
+* **`au.*.error.message`** is derived from the failing exception. With capture
+  off it is the exception type alone, and the span status description is the
+  same string, because an exception message or a traceback can quote the values
+  that flowed through the failing call. With capture on the message includes
+  `str(error)`. The framework's own instrumentation writes the full traceback
+  unconditionally.
+
+### A difference that is intentional
+
+The framework's own instrumentation writes `au.*` content carriers
+unconditionally: its attribute setters have no notion of the capture switch, so
+with content capture at its default `NO_CONTENT` a native-instrumented
+application still exports the raw prompt and the raw result. This package
+instead treats `NO_CONTENT` as a privacy guarantee for every span it produces.
+That is the first of the two deliberate differences below.
+
+## Session propagation
+
+Session ID propagation (`au.trace.session.id`, `AUSessionPropagator`) is part of
+agentUniverse's telemetry setup, not of the instrumentation: it comes from
+`SessionSpanProcessor` and `AUSessionPropagator`, which
+`TelemetryManager.init_from_config()` registers. This package activates only
+the Agent, LLM and Tool instrumentation and never touches global propagator or
+tracer provider state, so an application that needs session propagation should
+use `TelemetryManager` (which can also load this instrumentation by class
+path), or register the processor and the propagator itself:
 
 ```python
 from agentuniverse.base.tracing.otel.telemetry_manager import TelemetryManager
@@ -72,142 +213,20 @@ from agentuniverse.base.tracing.otel.telemetry_manager import TelemetryManager
 TelemetryManager().init_from_config({
     "service_name": "my-agent-app",
     "instrumentations": [
-        "agentuniverse.base.tracing.otel.instrumentation.llm.llm_instrumentor.LLMInstrumentor",
-        "agentuniverse.base.tracing.otel.instrumentation.tool.tool_instrumentor.ToolInstrumentor",
-        "agentuniverse.base.tracing.otel.instrumentation.agent.agent_instrumentor.AgentInstrumentor",
         "opentelemetry.instrumentation.agentuniverse:AgentUniverseInstrumentor",
     ],
 })
 ```
 
-## Compatibility with native agentUniverse instrumentation
-
-Every layer is bridged independently, by the same two steps.
-
-1. **Span creation is delegated.** For a layer the bridge looks for a native
-   instrumentor already installed, recognised as a bound method of that
-   instrumentor class sitting in the layer's wrapper globals
-   (`_agent_wrapper_sync` / `_agent_wrapper_async`, `_llm_wrapper_sync` /
-   `_llm_wrapper_async`, `_tool_wrapper_sync` / `_tool_wrapper_async` in
-   `agentuniverse.base.annotation.trace`). If one is active the bridge reuses
-   that live instance untouched; only when none is active does it create and
-   instrument one, and it then remembers that it owns it. Ownership is tracked
-   per layer, so any mixture of pre-activated and bridge-owned layers works.
-2. **`gen_ai.*` attributes are added on the native span.** For each layer the
-   bridge patches that layer's native `*SpanAttributesSetter` statics, so that
-   immediately after the native `au.*` attributes are written the LoongSuite
-   conventions are written onto the same span. Each wrapper calls the original
-   setter first and fails safe.
-
-| Layer | Native instrumentor (`...otel.instrumentation.`) | Setter seam patched | Native span |
-| --- | --- | --- | --- |
-| Agent | `agent.agent_instrumentor.AgentInstrumentor` | `AgentSpanAttributesSetter.set_input_attributes`, `set_success_attributes`, `set_error_attributes` | `au.agent.{name}`, `SpanKind.INTERNAL` |
-| LLM | `llm.llm_instrumentor.LLMInstrumentor` | `LLMSpanAttributesSetter.set_input_attributes`, `set_success_attributes`, `set_error_attributes`, `set_first_token_attributes` | `au.llm.{name}`, `SpanKind.INTERNAL` |
-| Tool | `tool.tool_instrumentor.ToolInstrumentor` | `ToolSpanAttributesSetter.set_input_attributes`, `set_success_attributes`, `set_error_attributes` | `au.tool.{name}`, `SpanKind.INTERNAL` |
-
-Native code keeps full ownership of span lifetime and status, metrics,
-streaming first-token timing, token usage aggregation, conversation memory
-recording and error handling, on all three layers. `uninstrument()` restores
-the original setters of every layer and uninstruments only the native
-instrumentors this bridge created; a pre-activated layer is left running, and
-exactly as the application configured it.
-
-Both `run` and `async_run`, and `@trace_llm` / `@trace_tool` on sync and async
-methods, are covered, because the native sync and async wrappers both go
-through the same setters. Instrument and uninstrument are sentinelled, so
-repeating either is a no-op and re-instrumenting afterwards works.
-
-### What the bridge adds
-
-| Layer | gen_ai attributes added (after the native ones) | Native attributes kept |
-| --- | --- | --- |
-| Agent | `gen_ai.span.kind=AGENT`, `gen_ai.operation.name=invoke_agent`, `gen_ai.framework=agentuniverse`, `gen_ai.agent.name`, `gen_ai.input.messages` (capture on), `gen_ai.usage.total_tokens/input_tokens/output_tokens` | `au.span.kind`, `au.agent.name`, `au.agent.input`, `au.agent.output`, `au.agent.status`, `au.agent.duration`, `au.agent.pair_id`, `au.agent.streaming`, `au.agent.first_token.duration`, `au.agent.error.type`, `au.agent.error.message`, `au.trace.caller_name`, `au.trace.caller_type`, `au.agent.usage.*` |
-| LLM | `gen_ai.span.kind=LLM`, `gen_ai.operation.name=chat`, `gen_ai.framework=agentuniverse`, `gen_ai.request.temperature` (only when the caller set one), `gen_ai.input.messages` / `gen_ai.output.messages` (capture on), `gen_ai.response.time_to_first_token`, `gen_ai.usage.*` | `au.span.kind`, `au.llm.name`, `au.llm.channel_name`, `au.llm.input`, `au.llm.output`, `au.llm.llm_params`, `au.llm.streaming`, `au.llm.duration`, `au.llm.status`, `au.llm.first_token.duration`, `au.llm.error.type`, `au.llm.error.message`, `au.trace.caller_name`, `au.trace.caller_type`, `au.llm.usage.*` |
-| Tool | `gen_ai.span.kind=TOOL`, `gen_ai.operation.name=execute_tool`, `gen_ai.framework=agentuniverse`, `gen_ai.tool.name`, `gen_ai.tool.type=function`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments` / `gen_ai.tool.call.result` (capture on), `gen_ai.usage.*` | `au.span.kind`, `au.tool.name`, `au.tool.input`, `au.tool.output`, `au.tool.duration`, `au.tool.status`, `au.tool.pair_id`, `au.tool.error.type`, `au.tool.error.message`, `au.trace.caller_name`, `au.trace.caller_type`, `au.tool.usage.*` |
-
-`gen_ai.agent.name` comes from the source name the native input setter already
-recorded as `au.agent.name`, and `gen_ai.tool.call.id` from the native
-`au.tool.pair_id`, so the two namespaces can never disagree about identity.
-`gen_ai.usage.*` is mirrored from the `au.*.usage.*` counters the native setter
-just wrote, non-zero values only -- which is also why a layer that used no
-tokens carries no `gen_ai.usage.*` attributes at all.
-
-The native instrumentors write no `gen_ai.*` attribute themselves, so nothing
-here duplicates or overwrites a value the framework already set.
-
-| Layer | Native metrics, emitted unchanged |
-| --- | --- |
-| Agent | `agent_calls_total`, `agent_errors_total`, `agent_call_duration`, `agent_first_token_duration`, `agent_total_tokens`, `agent_prompt_tokens`, `agent_completion_tokens`, `agent_cached_tokens`, `agent_reasoning_tokens` |
-| LLM | `llm_calls_total`, `llm_errors_total`, `llm_call_duration`, `llm_first_token_duration`, `llm_total_tokens`, `llm_prompt_tokens`, `llm_completion_tokens`, `llm_cached_tokens`, `llm_reasoning_tokens` |
-| Tool | `tool_calls_total`, `tool_errors_total`, `tool_call_duration`, `tool_total_tokens`, `tool_prompt_tokens`, `tool_completion_tokens`, `tool_cached_tokens`, `tool_reasoning_tokens` |
-
-## Content capture
-
-Content capture is governed by the shared GenAI switch used by every loongsuite
-instrumentation. Its mode is read once, at `instrument()` time. An absent or
-invalid value defaults to `NO_CONTENT` (no message content), so sensitive
-prompts are never exported without opt-in:
-
-```bash
-# Record message content on spans (default is NO_CONTENT):
-export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=SPAN_ONLY
-```
-
-The native span carries user content in two places on each layer, and one
-switch covers both:
-
-| | capture off (default) | capture on (`SPAN_ONLY` / `SPAN_AND_EVENT`) |
-| --- | --- | --- |
-| `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` | not written | written |
-| `au.agent.input` / `au.agent.output`, `au.llm.input` / `au.llm.output`, `au.tool.input` / `au.tool.output` (bridge-owned layer) | not written | written by the native setter |
-| the same attributes on a layer the application activated itself | governed by the application's config | governed by the application's config |
-
-Suppressing the `gen_ai.*` content alone would not be a privacy guarantee: the
-native setters write the raw prompt and the raw result to their `au.*` content
-carriers unconditionally, and would still export them. So for a layer this
-bridge activated, the content-bearing setters are handed a redacting view of
-the span that drops exactly that layer's two content attributes -- while the
-identity, caller, timing, status, pairing, token usage and error attributes are
-all still recorded, and every metric is untouched. Content capture is
-all-or-nothing per layer: either the input and the output are both on the span,
-or neither is.
-
-Only `SPAN_ONLY` and `SPAN_AND_EVENT` count as "on" -- `EVENT_ONLY` does not,
-because the bridge never emits events. `agent.run(input=...)`, the LLM
-`prompt` / `messages` arguments and the tool's arguments are mapped onto the
-conventional GenAI messages; when no recognized input key is present the
-remaining call arguments are serialized as JSON (runtime plumbing such as
-`callbacks` is left out).
-
-**A native instrumentor the application activated itself is never filtered.**
-When the native instrumentor is pre-activated by the application (e.g. via
-TelemetryManager), its `au.agent.input/output` behavior is governed by the
-application's config; the LoongSuite bridge does not override it. The same holds
-for the LLM and tool layers. The bridge only ever changes the behaviour of an
-instrumentor it created, which is why the two ownership modes are called out
-separately above. On such a layer the `gen_ai.*` content still follows the
-capture switch.
-
-## Session propagation
-
-Session ID propagation (`au.trace.session.id`, `AUSessionPropagator`) requires
-agentUniverse's `TelemetryManager.init_from_config()`. The LoongSuite bridge
-activates only the Agent, LLM and Tool instrumentors; it does not register the
-`SessionSpanProcessor` or the propagator, and it deliberately never touches
-global propagator or tracer provider state. Applications that need session
-propagation should use TelemetryManager, or register the processor and the
-propagator themselves.
-
-That path is verified for real: a test runs
-`TelemetryManager.init_from_config()` with an in-memory exporter in a separate
-process, sets the session id through the framework, and asserts that the
-agent, LLM and tool spans all carry `au.trace.session.id`, that the propagator
-injects both `AU-SessionId` and `auSessionId` into a carrier, and that
-extracting a carrier restores the session. Running it out of process keeps the
-one-shot global provider and propagator out of the pytest process, which is
-also what the bridge's own tests assert -- instrumenting through this package
-leaves `trace.get_tracer_provider()` and `propagate.get_global_textmap()`
-untouched.
+That path is verified for real: a test runs `TelemetryManager.init_from_config()`
+with an in-memory exporter in a separate process, sets the session id through
+the framework, and asserts that the agent and LLM spans both carry
+`au.trace.session.id`, that injecting into a carrier writes `AU-SessionId` and
+`auSessionId`, and that extracting such a carrier restores the session id.
+Running it out of process keeps the one-shot global provider and propagator out
+of the pytest process -- which the main process asserts too: instrumenting
+through this package leaves `trace.get_tracer_provider()` and
+`propagate.get_global_textmap()` untouched.
 
 ## Token usage
 
@@ -218,79 +237,89 @@ fields are `text_in`, `image_in`, `audio_in`, `cached_in`, `text_out`,
 are read-only derived properties. Constructing
 `TokenUsage(prompt=3, completion=5, total=8)` therefore sets nothing at all
 (pydantic drops the unknown fields, leaving every counter zero) --
-`TokenUsage(text_in=3, text_out=5)` is the non-zero form. The child-LLM
-aggregation into the parent agent span and metrics is verified with a real
-`@trace_llm` method returning that usage, so the agent span ends up with
-`au.agent.usage.total_tokens=8`, `prompt_tokens=3` and `completion_tokens=5`,
-and `gen_ai.usage.*` mirrors exactly those numbers.
+`TokenUsage(text_in=3, text_out=5)` is the non-zero form.
 
-### Known upstream caveats
+Aggregation is verified end to end with a real `@trace_llm` method returning
+that usage: the LLM span carries `au.llm.usage.total_tokens=8`,
+`prompt_tokens=3`, `completion_tokens=5` plus the matching `gen_ai.usage.*`,
+and the same numbers appear on the parent agent span
+(`au.agent.usage.total_tokens=8`, ...) and in the `agent_tokens` metrics,
+recorded once.
 
-These are agentUniverse 0.0.19.1 behaviours the bridge does not change, pinned
-by tests so a framework upgrade shows up as a failing test rather than a silent
-change:
+### A second intentional difference: streamed usage
 
-* **Streaming usage is double counted into the parent.** On the streaming LLM
-  path the native instrumentor adds the streamed usage to the LLM span's token
-  entry once in `process_sync_stream` / `process_async_stream` and again in
-  `_finalize_streaming_result`, so `LLMSpanManager.cleanup()` hands the parent
-  twice the usage. The LLM span keeps the real numbers (4 / 6 / 10 for the test
-  stream); the parent agent span and the `agent_*_tokens` metrics see 8 / 12 /
-  20.
-* **A native instrumentor's `__init__` resets its saved state.** The native
-  classes are `BaseInstrumentor` singletons, but `__init__` runs on every
-  construction and clears the wrapper originals and metric recorder the
-  instrumentor is already serving calls with. Constructing one while it is
-  active therefore breaks a later `uninstrument()` (it blanks the trace-module
-  globals) and can leave a running wrapper with no metrics recorder:
+On the framework's streaming LLM path, the streamed usage is added to the LLM
+span's token entry twice -- once while the stream is consumed, once again when
+the stream is finalized -- so the parent agent span and the `agent_*_tokens`
+metrics receive double the real usage. That is an upstream double count.
 
-  ```python
-  instrumentor = AgentInstrumentor()
-  instrumentor.instrument()           # saved original = _default_agent_wrapper_sync
+This implementation aggregates streamed usage exactly once. The baseline test
+pins both numbers against a real streamed call: the framework's parent sees
+20 tokens for a stream whose real usage is 10, LoongSuite's sees 10. The LLM
+span itself carries the real numbers on both paths.
 
-  AgentInstrumentor()                 # same object, but __init__ runs again:
-                                      # saved original is now None
+## Divergence from the framework's own instrumentation
 
-  AgentInstrumentor().uninstrument()  # sets the trace-module global to None
-  agent.run(input="hi")               # TypeError: 'NoneType' object is not callable
-  ```
-
-  The bridge is immune by construction: it reaches the live instance through
-  the trace-module globals and only constructs a native instrumentor when that
-  layer has none, always immediately before instrumenting it. When you
-  uninstrument a native instrumentor yourself, hold on to the handle you
-  instrumented with rather than constructing a fresh one.
+| Area | Framework's instrumentors | This package |
+| --- | --- | --- |
+| Span names, kinds, `au.*` attribute keys, metric names and labels | baseline | identical; a test compares a native run and a LoongSuite run of the same workload item by item |
+| Content capture | always writes `au.*` content | honours the capture switch; `NO_CONTENT` writes no content on any layer (intentional) |
+| Streamed LLM usage into the parent | double counted | counted once (intentional) |
+| `au.*.error.message` | full traceback | `str(error)` when capture is on, the exception type when it is off |
+| `au.llm.llm_params` | whole mapping | whole mapping when capture is on, safe scalar parameters when it is off |
+| Session processor and propagator | registered by `TelemetryManager` | unchanged: not registered, not touched; works when the application registers them |
 
 ## Fail-safe telemetry
 
-Instrumentation never changes agent behaviour: a failure while setting an
-attribute or capturing content is swallowed and the agent's own exception is
-re-raised unchanged by the native wrapper.
+Instrumentation never changes agent behaviour. Every attribute write, metric
+record, memory call, invocation-chain push and content serialization is
+guarded: a failure inside telemetry is logged and swallowed, the instrumented
+call still runs, and its own exception -- including `asyncio.CancelledError` --
+is re-raised unchanged after the span has been closed with an error status. A
+layer that cannot even be constructed calls the original function directly.
+
+## Modules
+
+| Module | Responsibility |
+| --- | --- |
+| `__init__.py` | `AgentUniverseInstrumentor`: snapshot, transactional takeover of the six extension points, rollback, restore, tracer/meter/handler assembly |
+| `_common.py` | shared span lifecycle, serialization, privacy, GenAI identity, token bookkeeping, metrics and fail-safe helpers |
+| `_agent.py` | the agent layer: span, attributes, nine metrics, streaming first token, memory, aggregation |
+| `_llm.py` | the LLM layer: span, attributes, nine metrics, deferred stream finalization, plugin hook, usage |
+| `_tool.py` | the tool layer: span, attributes, eight metrics, memory |
 
 ## Tests
 
-The suite runs against a real `agentUniverse` install with no stand-in, and
-covers every ownership combination: native instrumentors only, LoongSuite only,
-both enabled, and partial ownership with one layer pre-activated and the others
-bridge-owned. In each setup the call tree is asserted to be exactly one span
-per layer -- `au.agent.rich_agent` + `au.llm.stub_llm` + `au.tool.stub_tool` --
-with the native `au.*` attributes and, when the bridge is engaged, the
-`gen_ai.*` ones on those same spans.
+The suite runs against a real `agentUniverse` 0.0.19.1 install (Python 3.12)
+with no stand-in: 74 tests pass, one is skipped.
 
-Beyond span shape, the suite asserts the native metrics through an
-`InMemoryMetricReader` (each metric recorded exactly once, `*_calls_total` == 1,
-the `*_tokens` histograms carrying the real non-zero totals), sync and async
-paths on all three layers, streaming first-token timing for the agent and the
-LLM (positive duration on the span and in the `*_first_token_duration`
-histogram), error status and error metrics, the content-capture matrix in both
-ownership modes, the instrument/uninstrument lifecycle including setter and
-wrapper-global restoration, and the session path described above.
+* **Baseline matrix.** The same workload is run twice -- once with the
+  framework's three instrumentors, once with this package -- and the two runs
+  are compared: span tree and parent relationships, span names, kinds and
+  status, the `au.*` key set and value semantics, all 26 metrics with their
+  labels and values, non-zero token usage (`TokenUsage(text_in=3, text_out=5)`
+  reaching the agent span as 8 / 3 / 5), positive first-token durations, error
+  spans, and `ConversationMemoryModule` side effects. Dynamic values (durations,
+  pair ids, UUIDs) are compared by type and sign, not by value.
+* **Ownership and lifecycle.** Native-only, LoongSuite-only, all three native
+  instrumentors plus LoongSuite, and mixed setups; one span per layer in every
+  case; instrument/uninstrument order, double instrument, failed install
+  rollback, wrapper identity restoration, and native wrappers resuming work
+  after a restore.
+* **Behaviour.** Sync and async paths on all three layers, streaming agent and
+  LLM first-token timing (positive durations on the span and in the
+  `*_first_token_duration` histogram), stream finalization on completion,
+  error and early close, error status and error metrics, content capture in
+  both modes with a secret-scanning test that looks at every attribute value of
+  every span, and the `_llm_plugins` hook.
+* **Session.** The `TelemetryManager` path described above, in an isolated
+  process.
 
-Mutation checks confirm the tests are load-bearing: neutering the agent, LLM or
-tool bridge, disabling the privacy filter, disabling the `gen_ai` usage mirror,
-or removing the session id from the session probe each turns the corresponding
-tests red (16, 16, 12, 14, 4 and 1 failures respectively), and the suite is
-green again once restored.
+Mutation checks confirm the tests are load-bearing. Neuter one seam, run the
+suite, and the tests that must notice go red: the agent, LLM or tool wrapper
+(28, 26 and 13 failures), the transactional takeover (31), rollback/restore
+(3), the privacy switch (9), stream finalization (7), token aggregation (6) and
+the session probe (1).
 
 ```bash
 python -m pytest tests -v

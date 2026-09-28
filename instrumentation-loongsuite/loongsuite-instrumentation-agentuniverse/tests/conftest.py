@@ -15,13 +15,13 @@
 """Fixtures for the agentUniverse instrumentation tests.
 
 These tests run against a real ``agentUniverse`` install, with no stand-in for
-the framework: the native Agent, LLM and Tool instrumentors are what create the
-spans under test, and the LoongSuite instrumentor must add ``gen_ai.*``
-attributes to those same spans instead of creating a second one.
+the framework: real ``Agent``/``Tool`` subclasses and a real ``@trace_llm``
+method drive the extension points this package claims, and the framework's own
+instrumentors drive the same calls in the baseline runs the results are compared
+with.
 
-The agents, LLM and tool below are real framework objects -- a real ``Agent``
-subclass, a real ``@trace_llm`` method and a real ``Tool`` subclass -- so the
-native wrappers, setters, metrics and token aggregation all run for real.
+The agents, LLM and tool below are real framework objects, so the wrappers,
+``au.*`` attributes, metrics and token aggregation all run for real.
 """
 
 import os
@@ -68,6 +68,9 @@ from agentuniverse.base.tracing.otel.instrumentation.tool.tool_instrumentor impo
 )
 from agentuniverse.llm.llm_output import LLMOutput, TokenUsage  # noqa: E402
 
+from opentelemetry.instrumentation.agentuniverse import (  # noqa: E402
+    AgentUniverseInstrumentor,
+)
 from opentelemetry.sdk.metrics import MeterProvider  # noqa: E402
 from opentelemetry.sdk.metrics.export import (  # noqa: E402
     InMemoryMetricReader,
@@ -77,6 +80,8 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor  # noqa: E402
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (  # noqa: E402
     InMemorySpanExporter,
 )
+
+from . import baseline  # noqa: E402
 
 # The native instrumentor builds a ``ConversationMemoryModule`` at call time,
 # which reads the application config manager on construction. Seed it before
@@ -366,6 +371,208 @@ def make_agent() -> Callable[..., Agent]:
     return build_agent
 
 
+# ---------------------------------------------------------------------------
+# Harnesses: one run under each instrumentation setup
+# ---------------------------------------------------------------------------
+
+
+class Harness:
+    """One instrumentation setup and the telemetry it recorded."""
+
+    def __init__(
+        self,
+        span_exporter: InMemorySpanExporter,
+        metric_reader: InMemoryMetricReader,
+        close: Callable[[], None],
+    ) -> None:
+        self.span_exporter = span_exporter
+        self.metric_reader = metric_reader
+        self._close = close
+
+    def close(self) -> None:
+        self._close()
+
+    # -- what the run produced ---------------------------------------
+
+    def spans(self) -> list:
+        return list(self.span_exporter.get_finished_spans())
+
+    def records(self) -> list:
+        return baseline.snapshot(self.spans())
+
+    def record(self, name: str) -> Any:
+        return baseline.find(self.records(), name)
+
+    def metrics(self) -> dict:
+        return baseline.collect_metrics(self.metric_reader)
+
+    def clear(self) -> None:
+        self.span_exporter.clear()
+
+
+def _providers() -> tuple:
+    """A span exporter, tracer provider, metric reader and meter provider."""
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[reader])
+    return exporter, provider, reader, meter_provider
+
+
+def enable_native_instrumentors(
+    provider: TracerProvider, meter_provider: MeterProvider
+) -> list:
+    """Turn on the framework's own three instrumentors for one run.
+
+    A live instrumentor is reused rather than rebuilt: constructing a native
+    instrumentor while one is active resets the wrapper originals it saved, and
+    a later ``uninstrument()`` would then blank the trace module globals.
+    """
+    enabled = []
+    for native_cls in NATIVE_LAYER_GLOBALS:
+        instrumentor = active_native_instrumentor(native_cls) or native_cls()
+        instrumentor.instrument(
+            tracer_provider=provider, meter_provider=meter_provider
+        )
+        enabled.append(instrumentor)
+    return enabled
+
+
+def _close_providers(*providers: Any) -> Callable[[], None]:
+    def close() -> None:
+        for provider in providers:
+            provider.shutdown()
+
+    return close
+
+
+@pytest.fixture
+def native_harness() -> Iterator[Harness]:
+    """A run under the framework's own Agent, LLM and Tool instrumentors."""
+    exporter, provider, reader, meter_provider = _providers()
+    enable_native_instrumentors(provider, meter_provider)
+    harness = Harness(
+        exporter, reader, _close_providers(provider, meter_provider)
+    )
+    yield harness
+    harness.close()
+
+
+@pytest.fixture
+def loongsuite_harness() -> Iterator[Harness]:
+    """A run under this package's own wrappers."""
+    instrumentor = AgentUniverseInstrumentor()
+    exporter, provider, reader, meter_provider = _providers()
+    instrumentor.instrument(
+        tracer_provider=provider, meter_provider=meter_provider
+    )
+    harness = Harness(
+        exporter, reader, _close_providers(provider, meter_provider)
+    )
+    yield harness
+    instrumentor.uninstrument()
+    harness.close()
+
+
+@pytest.fixture
+def both_harness() -> Iterator[Harness]:
+    """A run under the framework's instrumentors *and* this package.
+
+    The framework's instrumentors go first, exactly as an application that
+    already uses ``TelemetryManager`` would install them, and this package then
+    takes the extension points over for the duration of the run.
+    """
+    exporter, provider, reader, meter_provider = _providers()
+    enable_native_instrumentors(provider, meter_provider)
+    instrumentor = AgentUniverseInstrumentor()
+    instrumentor.instrument(
+        tracer_provider=provider, meter_provider=meter_provider
+    )
+    harness = Harness(
+        exporter, reader, _close_providers(provider, meter_provider)
+    )
+    yield harness
+    instrumentor.uninstrument()
+    harness.close()
+
+
+class Runs:
+    """One workload recorded under each instrumentation setup."""
+
+    def __init__(
+        self,
+        native_spans: Any,
+        native_metrics: dict,
+        our_spans: Any,
+        our_metrics: dict,
+    ) -> None:
+        self.native_records = baseline.snapshot(native_spans)
+        self.native_metrics = native_metrics
+        self.ours_records = baseline.snapshot(our_spans)
+        self.ours_metrics = our_metrics
+
+
+@pytest.fixture
+def compare_runs() -> Iterator[Callable[[Callable[[], None]], Runs]]:
+    """Run one workload twice: first under the framework, then under this one.
+
+    The two setups cannot hold the extension points at the same time -- this
+    package takes them over on purpose -- so each phase gets its own providers
+    and runs the workload itself. That is what makes the two runs comparable:
+    same workload, same configuration, one setup each.
+    """
+
+    def compare(workload: Callable[[], None]) -> Runs:
+        exporter, provider, reader, meter_provider = _providers()
+        natives = enable_native_instrumentors(provider, meter_provider)
+        try:
+            workload()
+        finally:
+            native_spans = exporter.get_finished_spans()
+            native_metrics = baseline.collect_metrics(reader)
+            for native in natives:
+                native.uninstrument()
+            provider.shutdown()
+            meter_provider.shutdown()
+
+        exporter, provider, reader, meter_provider = _providers()
+        instrumentor = AgentUniverseInstrumentor()
+        instrumentor.instrument(
+            tracer_provider=provider, meter_provider=meter_provider
+        )
+        try:
+            workload()
+        finally:
+            our_spans = exporter.get_finished_spans()
+            our_metrics = baseline.collect_metrics(reader)
+            instrumentor.uninstrument()
+            provider.shutdown()
+            meter_provider.shutdown()
+
+        return Runs(native_spans, native_metrics, our_spans, our_metrics)
+
+    yield compare
+
+
+@pytest.fixture
+def session_exporter() -> Iterator[Any]:
+    """A span exporter the session subprocess tests can read back."""
+    yield InMemorySpanExporter()
+
+
+@pytest.fixture
+def configured_providers(
+    session_exporter: InMemorySpanExporter,
+) -> Iterator[tuple]:
+    """Tracer and meter providers a test can hand to any instrumentor."""
+    _, provider, reader, meter_provider = _providers()
+    provider.add_span_processor(SimpleSpanProcessor(session_exporter))
+    yield provider, meter_provider, reader
+    provider.shutdown()
+    meter_provider.shutdown()
+
+
 def active_native_instrumentor(native_cls: type = AgentInstrumentor) -> Any:
     """The live native instrumentor for one layer, without constructing one.
 
@@ -382,19 +589,15 @@ def active_native_instrumentor(native_cls: type = AgentInstrumentor) -> Any:
 
 @pytest.fixture(autouse=True)
 def isolate_instrumentation() -> Iterator[None]:
-    """Keep the templated trace globals and the native singletons pristine.
+    """Keep the trace globals and the instrumentor singletons pristine.
 
-    All four instrumentors are ``BaseInstrumentor`` singletons and each native
-    one lives by swapping module-level globals in
+    Every instrumentor here is a ``BaseInstrumentor`` singleton and each one
+    lives by swapping module-level globals in
     ``agentuniverse.base.annotation.trace``. A test that leaves any of them
     behind would silently change the next test's result, so force every layer
     back to its pre-test state.
     """
-    from opentelemetry.instrumentation.agentuniverse import (
-        AgentUniverseInstrumentor,
-    )
-
-    bridge = AgentUniverseInstrumentor()
+    instrumentor = AgentUniverseInstrumentor()
     saved = {
         name: getattr(trace_module, name) for name in NATIVE_WRAPPER_GLOBALS
     }
@@ -403,14 +606,14 @@ def isolate_instrumentation() -> Iterator[None]:
 
     # Re-read the active native instrumentors at teardown: a test may have
     # enabled one that was not active when it started.
-    instrumentors = [bridge] + [
+    instrumentors = [instrumentor] + [
         active_native_instrumentor(native_cls)
         for native_cls in NATIVE_LAYER_GLOBALS
     ]
-    for instrumentor in instrumentors:
-        if instrumentor is not None and instrumentor.__dict__.get(
+    for active in instrumentors:
+        if active is not None and active.__dict__.get(
             "_is_instrumented_by_opentelemetry"
         ):
-            instrumentor.uninstrument()
+            active.uninstrument()
     for name, value in saved.items():
         setattr(trace_module, name, value)

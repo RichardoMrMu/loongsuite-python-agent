@@ -12,33 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exporter and reader that publish themselves for the session test.
+"""State the session probe subprocess shares with its TelemetryManager config.
 
-``TelemetryManager`` builds its span exporter and metric reader from class
-paths, so those classes have to live in an importable module and hand the
-instances they create back to the test. That is all this module is for.
+``TelemetryManager`` builds its span processor from an import path, so the
+exporter has to live in a module that is *imported*. Defined in the probe script
+itself, it would belong to ``__main__`` there while ``TelemetryManager``
+imported a second copy, and the spans would be collected into a list no test can
+see.
 """
 
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-    InMemorySpanExporter,
-)
+from typing import Any
 
-SPAN_EXPORTERS: dict = {}
-METRIC_READERS: dict = {}
+from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
-
-class RecordingSpanExporter(InMemorySpanExporter):
-    """An ``InMemorySpanExporter`` that publishes itself on construction."""
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
-        SPAN_EXPORTERS["exporter"] = self
+#: Every span the exporter was handed, oldest first.
+SPANS: list = []
 
 
-class RecordingMetricReader(InMemoryMetricReader):
-    """An ``InMemoryMetricReader`` that publishes itself on construction."""
+class RecordingExporter(SpanExporter):
+    """Append every exported span to :data:`SPANS`."""
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
-        METRIC_READERS["reader"] = self
+    def export(self, spans: Any) -> Any:
+        SPANS.extend(spans)
+        return SpanExportResult.SUCCESS
+
+    def shutdown(self) -> None:
+        return None

@@ -12,1651 +12,1582 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the agentUniverse instrumentation bridge.
+"""Tests for the LoongSuite agentUniverse instrumentation.
 
-Everything here runs against a real ``agentUniverse`` install, with no
-stand-in for the framework. The package bridges three layers -- the agent, the
-``@trace_llm`` call and the tool -- and in every setup each layer must produce
-exactly one span:
+Everything here runs against a real ``agentUniverse`` install. The same fixtures
+are driven twice -- once under the framework's own Agent/LLM/Tool instrumentors
+and once under this package -- and the two runs are compared, so the ``au.*``
+contract this package has to keep is checked against its source of truth rather
+than against a copy of it.
 
-* native Agent/LLM/Tool instrumentors only -- the ``au.*`` spans, no
-  ``gen_ai.*`` attributes;
-* LoongSuite only -- those same native spans plus the ``gen_ai.*`` attributes;
-* both enabled -- still one span per layer, carrying both namespaces.
-
-Asserting the single-span property on every path is what catches a regression
-back to wrapping ``Agent.run``, the LLM call or the tool call as a duplicated
-span, rather than as a silent extra span in production.
-
-Attribute names are spelled out as literals on purpose. They are the wire
-contract, so the tests should fail if the instrumentation renames one.
+Two differences from the framework's own instrumentation are deliberate and
+tested as such: user content is dropped from every span while content capture is
+off, and a streamed LLM response is counted onto its parent span once instead of
+twice.
 """
 
-from __future__ import annotations
-
+import ast
+import asyncio
+import importlib.metadata as metadata
 import json
+import os
 import queue
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Optional
 
 import pytest
+from agentuniverse.agent.memory.conversation_memory.conversation_memory_module import (  # noqa: E501
+    ConversationMemoryModule as RealConversationMemoryModule,
+)
 from agentuniverse.base.annotation import trace as trace_module
-from agentuniverse.base.tracing.otel.instrumentation.agent.agent_instrumentor import (  # noqa: E501
-    AgentInstrumentor,
-    AgentSpanAttributesSetter,
-)
-from agentuniverse.base.tracing.otel.instrumentation.llm.llm_instrumentor import (  # noqa: E501
-    LLMInstrumentor,
-    LLMSpanAttributesSetter,
-)
-from agentuniverse.base.tracing.otel.instrumentation.tool.tool_instrumentor import (  # noqa: E501
-    ToolInstrumentor,
-    ToolSpanAttributesSetter,
-)
-from agentuniverse.llm.llm_output import TokenUsage
+from agentuniverse.base.annotation.trace import trace_llm
+from agentuniverse.base.util.monitor.monitor import Monitor
+from agentuniverse.llm.llm_output import LLMOutput, TokenUsage
 
-from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.agentuniverse import (
     AgentUniverseInstrumentor,
 )
-from opentelemetry.sdk.metrics.export import (
-    InMemoryMetricReader,
-)
-from opentelemetry.sdk.trace import ReadableSpan
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-    InMemorySpanExporter,
-)
-from opentelemetry.trace import StatusCode
+from opentelemetry.instrumentation.agentuniverse import _agent as agent_layer
+from opentelemetry.instrumentation.agentuniverse import _tool as tool_layer
 
+from . import baseline
 from .conftest import (
-    AGENT_LAYER,
-    LLM_LAYER,
-    NATIVE_LAYER_GLOBALS,
-    NATIVE_WRAPPER_GLOBALS,
-    TOOL_LAYER,
-    AsyncLLM,
-    AsyncRichAgent,
     FailingAgent,
     FailingLLM,
     FailingTool,
-    LLMAgent,
-    MessagesLLM,
     RichAgent,
     StreamingAgent,
+    StreamingLLM,
     StreamingLLMAgent,
+    StubAgent,
     StubLLM,
     StubTool,
-    ToolAgent,
     active_native_instrumentor,
     build_agent,
+    enable_native_instrumentors,
 )
 
-AU_AGENT_SPAN_PREFIX = "au.agent."
-AU_LLM_SPAN_PREFIX = "au.llm."
-AU_TOOL_SPAN_PREFIX = "au.tool."
-GEN_AI_PREFIX = "gen_ai."
-SESSION_ATTR = "au.trace.session.id"
-_CONTENT_ENV = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
-_USER_MESSAGE = [
-    {"role": "user", "parts": [{"content": "hello", "type": "text"}]}
-]
-
-# The metric names each native instrumentor is expected to keep emitting.
-# These are a wire contract too: a rename here means dashboards go blank.
-_METRIC_NAMES = {
-    AGENT_LAYER: (
-        "agent_calls_total",
-        "agent_errors_total",
-        "agent_call_duration",
-        "agent_first_token_duration",
-        "agent_total_tokens",
-        "agent_prompt_tokens",
-        "agent_completion_tokens",
-        "agent_cached_tokens",
-        "agent_reasoning_tokens",
-    ),
-    LLM_LAYER: (
-        "llm_calls_total",
-        "llm_errors_total",
-        "llm_call_duration",
-        "llm_first_token_duration",
-        "llm_total_tokens",
-        "llm_prompt_tokens",
-        "llm_completion_tokens",
-        "llm_cached_tokens",
-        "llm_reasoning_tokens",
-    ),
-    TOOL_LAYER: (
-        "tool_calls_total",
-        "tool_errors_total",
-        "tool_call_duration",
-        "tool_total_tokens",
-        "tool_prompt_tokens",
-        "tool_completion_tokens",
-        "tool_cached_tokens",
-        "tool_reasoning_tokens",
-    ),
-}
-
-_ALL_LAYERS = (AGENT_LAYER, LLM_LAYER, TOOL_LAYER)
-_SPAN_PREFIXES = {
-    AGENT_LAYER: AU_AGENT_SPAN_PREFIX,
-    LLM_LAYER: AU_LLM_SPAN_PREFIX,
-    TOOL_LAYER: AU_TOOL_SPAN_PREFIX,
-}
-_NATIVE_CLASSES = {
-    AGENT_LAYER: AgentInstrumentor,
-    LLM_LAYER: LLMInstrumentor,
-    TOOL_LAYER: ToolInstrumentor,
-}
-_SETTER_CLASSES = {
-    AGENT_LAYER: AgentSpanAttributesSetter,
-    LLM_LAYER: LLMSpanAttributesSetter,
-    TOOL_LAYER: ToolSpanAttributesSetter,
-}
-_BRIDGED_METHODS = {
-    AGENT_LAYER: (
-        "set_input_attributes",
-        "set_success_attributes",
-        "set_error_attributes",
-    ),
-    LLM_LAYER: (
-        "set_input_attributes",
-        "set_success_attributes",
-        "set_error_attributes",
-        "set_first_token_attributes",
-    ),
-    TOOL_LAYER: (
-        "set_input_attributes",
-        "set_success_attributes",
-        "set_error_attributes",
-    ),
-}
-_USAGE_KEYS = (
-    "au.{layer}.usage.total_tokens",
-    "au.{layer}.usage.prompt_tokens",
-    "au.{layer}.usage.completion_tokens",
-    "au.{layer}.usage.detail_tokens",
-)
-_CONTENT_KEYS = {
-    AGENT_LAYER: ("au.agent.input", "au.agent.output"),
-    LLM_LAYER: ("au.llm.input", "au.llm.output"),
-    TOOL_LAYER: ("au.tool.input", "au.tool.output"),
-}
-_GEN_AI_CONTENT_KEYS = (
-    "gen_ai.input.messages",
-    "gen_ai.output.messages",
-    "gen_ai.tool.call.arguments",
-    "gen_ai.tool.call.result",
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = (
+    PACKAGE_ROOT
+    / "src"
+    / "opentelemetry"
+    / "instrumentation"
+    / "agentuniverse"
 )
 
-_SESSION_ID = "session-abc123"
-_CARRIER_SESSION = "session-from-carrier"
-_SESSION_CHILD = Path(__file__).with_name("session_probe_child.py")
+CONTENT_ENV = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
+SECRET = "s3cr3t-token-do-not-leak"
+
+AGENT_SPAN = "au.agent."
+LLM_SPAN = "au.llm."
+TOOL_SPAN = "au.tool."
+
+AGENT_METRICS = (
+    "agent_calls_total",
+    "agent_errors_total",
+    "agent_call_duration",
+    "agent_first_token_duration",
+    "agent_total_tokens",
+    "agent_prompt_tokens",
+    "agent_completion_tokens",
+    "agent_cached_tokens",
+    "agent_reasoning_tokens",
+)
+LLM_METRICS = (
+    "llm_calls_total",
+    "llm_errors_total",
+    "llm_call_duration",
+    "llm_first_token_duration",
+    "llm_total_tokens",
+    "llm_prompt_tokens",
+    "llm_completion_tokens",
+    "llm_cached_tokens",
+    "llm_reasoning_tokens",
+)
+TOOL_METRICS = (
+    "tool_calls_total",
+    "tool_errors_total",
+    "tool_call_duration",
+    "tool_total_tokens",
+    "tool_prompt_tokens",
+    "tool_completion_tokens",
+    "tool_cached_tokens",
+    "tool_reasoning_tokens",
+)
+
+AGENT_AU_KEYS = {
+    "au.span.kind",
+    "au.agent.name",
+    "au.agent.input",
+    "au.agent.output",
+    "au.agent.duration",
+    "au.agent.status",
+    "au.agent.pair_id",
+    "au.agent.streaming",
+    "au.agent.first_token.duration",
+    "au.trace.caller_name",
+    "au.trace.caller_type",
+    "au.agent.usage.total_tokens",
+    "au.agent.usage.prompt_tokens",
+    "au.agent.usage.completion_tokens",
+    "au.agent.usage.detail_tokens",
+}
+LLM_AU_KEYS = {
+    "au.span.kind",
+    "au.llm.name",
+    "au.llm.channel_name",
+    "au.llm.input",
+    "au.llm.output",
+    "au.llm.llm_params",
+    "au.llm.streaming",
+    "au.llm.duration",
+    "au.llm.status",
+    "au.llm.first_token.duration",
+    "au.trace.caller_name",
+    "au.trace.caller_type",
+    "au.llm.usage.total_tokens",
+    "au.llm.usage.prompt_tokens",
+    "au.llm.usage.completion_tokens",
+    "au.llm.usage.detail_tokens",
+}
+TOOL_AU_KEYS = {
+    "au.span.kind",
+    "au.tool.name",
+    "au.tool.input",
+    "au.tool.output",
+    "au.tool.duration",
+    "au.tool.status",
+    "au.tool.pair_id",
+    "au.trace.caller_name",
+    "au.trace.caller_type",
+    "au.tool.usage.total_tokens",
+    "au.tool.usage.prompt_tokens",
+    "au.tool.usage.completion_tokens",
+    "au.tool.usage.detail_tokens",
+}
+
+#: Wrapper extension points this package claims.
+WRAPPER_GLOBALS = (
+    "_agent_wrapper_sync",
+    "_agent_wrapper_async",
+    "_llm_wrapper_sync",
+    "_llm_wrapper_async",
+    "_tool_wrapper_sync",
+    "_tool_wrapper_async",
+)
+
+#: Runtime source may not name, import or call these.
+FORBIDDEN_RUNTIME_REFERENCES = (
+    "AgentInstrumentor",
+    "LLMInstrumentor",
+    "ToolInstrumentor",
+    "AgentSpanAttributesSetter",
+    "LLMSpanAttributesSetter",
+    "ToolSpanAttributesSetter",
+    "AgentSpanManager",
+    "LLMSpanManager",
+    "ToolSpanManager",
+    "agent_instrumentor",
+    "llm_instrumentor",
+    "tool_instrumentor",
+)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@contextmanager
+def content_capture(mode: Optional[str]) -> Iterator[None]:
+    """Run a block with a given content-capturing mode."""
+    previous = os.environ.get(CONTENT_ENV)
+    if mode is None:
+        os.environ.pop(CONTENT_ENV, None)
+    else:
+        os.environ[CONTENT_ENV] = mode
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(CONTENT_ENV, None)
+        else:
+            os.environ[CONTENT_ENV] = previous
 
 
-def _attributes(span: ReadableSpan) -> dict[str, Any]:
-    return dict(span.attributes or {})
+def capture_on() -> Any:
+    return content_capture("SPAN_ONLY")
 
 
-def _spans(exporter: InMemorySpanExporter) -> list[ReadableSpan]:
-    return list(exporter.get_finished_spans())
+def capture_off() -> Any:
+    return content_capture("NO_CONTENT")
 
 
-def _single_span(exporter: InMemorySpanExporter) -> ReadableSpan:
-    spans = _spans(exporter)
-    assert len(spans) == 1, (
-        f"expected exactly one span, got {len(spans)}: "
-        f"{[span.name for span in spans]}"
-    )
-    return spans[0]
-
-
-def _layer_spans(
-    exporter: InMemorySpanExporter, layer: str
-) -> list[ReadableSpan]:
-    prefix = _SPAN_PREFIXES[layer]
-    return [span for span in _spans(exporter) if span.name.startswith(prefix)]
-
-
-def _single_layer_span(
-    exporter: InMemorySpanExporter, layer: str
-) -> ReadableSpan:
-    spans = _layer_spans(exporter, layer)
-    assert len(spans) == 1, (
-        f"expected exactly one {_SPAN_PREFIXES[layer]}* span, got "
-        f"{len(spans)}: {[span.name for span in spans]}"
-    )
-    return spans[0]
-
-
-def _assert_one_span_per_layer(exporter: InMemorySpanExporter) -> None:
-    """The three-layer call tree is exactly one span per layer."""
-    names = sorted(span.name for span in _spans(exporter))
-    assert names == [
-        "au.agent.rich_agent",
-        "au.llm.stub_llm",
-        "au.tool.stub_tool",
-    ], f"unexpected span tree: {names}"
-
-
-def _has_gen_ai_attributes(span: ReadableSpan) -> bool:
-    return any(key.startswith(GEN_AI_PREFIX) for key in _attributes(span))
-
-
-def _instrument_native(
-    layer: str, tracer_provider: Any, meter_provider: Any = None
-) -> Any:
-    """Enable one native layer the way an application would."""
-    instrumentor = _NATIVE_CLASSES[layer]()
-    instrumentor.instrument(
-        tracer_provider=tracer_provider,
-        meter_provider=meter_provider,
-        skip_dep_check=True,
-    )
-    return instrumentor
-
-
-def _instrument_all_natives(
-    tracer_provider: Any, meter_provider: Any = None
-) -> list[Any]:
+def layer_records(harness: Any, prefix: str) -> list:
     return [
-        _instrument_native(layer, tracer_provider, meter_provider)
-        for layer in _ALL_LAYERS
+        record
+        for record in harness.records()
+        if record.name.startswith(prefix)
     ]
 
 
-def _instrument_bridge(
-    tracer_provider: Any, meter_provider: Any = None
-) -> AgentUniverseInstrumentor:
-    instrumentor = AgentUniverseInstrumentor()
-    instrumentor.instrument(
-        tracer_provider=tracer_provider,
-        meter_provider=meter_provider,
-        skip_dep_check=True,
+def one_layer_record(harness: Any, prefix: str) -> Any:
+    records = layer_records(harness, prefix)
+    assert len(records) == 1, (
+        f"expected one {prefix}* span, got {baseline.names(harness.records())}"
     )
-    return instrumentor
+    return records[0]
 
 
-def _collect_metrics(
-    reader: InMemoryMetricReader,
-) -> dict[str, list[Any]]:
-    """Every recorded data point, keyed by metric name."""
-    collected: dict[str, list[Any]] = {}
-    for resource_metrics in reader.get_metrics_data().resource_metrics:
-        for scope_metrics in resource_metrics.scope_metrics:
-            for metric in scope_metrics.metrics:
-                points = getattr(metric.data, "data_points", [])
-                collected.setdefault(metric.name, []).extend(points)
-    return collected
+def metric_contract(metrics: dict) -> dict:
+    """Metric names with the label sets recorded for them."""
+    return {
+        name: sorted({tuple(sorted(point.labels.items())) for point in points})
+        for name, points in metrics.items()
+    }
 
 
-def _matching_points(
-    reader: InMemoryMetricReader, name: str, labels: dict
-) -> list[Any]:
-    matched = []
-    for point in _collect_metrics(reader).get(name, []):
-        attributes = dict(point.attributes)
-        if all(attributes.get(key) == value for key, value in labels.items()):
-            matched.append(point)
-    return matched
+def recorded_on_success(names: Any) -> list:
+    """The metrics a successful call is expected to have recorded.
 
-
-def _only_point(reader: InMemoryMetricReader, name: str, **labels: Any) -> Any:
-    matched = _matching_points(reader, name, labels)
-    assert len(matched) == 1, (
-        f"{name}: expected one data point matching {labels}, got "
-        f"{len(matched)}"
-    )
-    return matched[0]
-
-
-def _counter(reader: InMemoryMetricReader, name: str, **labels: Any) -> Any:
-    return _only_point(reader, name, **labels).value
-
-
-def _histogram_sum(
-    reader: InMemoryMetricReader, name: str, **labels: Any
-) -> Any:
-    return _only_point(reader, name, **labels).sum
-
-
-def _assert_au_agent_span(
-    span: ReadableSpan,
-    agent_name: str,
-    status: str = "success",
-    content: bool = True,
-) -> dict[str, Any]:
-    """Assert the native ``au.*`` agent span shape the bridge must preserve.
-
-    ``content=False`` asserts the privacy-filtered shape instead: the agent
-    identity, caller, timing, status, pairing and token usage stay, while the
-    two attributes that carry user content are gone.
+    A counter with no recorded value has no data point, so the framework's
+    own instrumentation exports exactly the same set as this package:
+    everything but the error counters, which have their own error-path
+    tests.
     """
-    attributes = _attributes(span)
-    assert span.name == f"{AU_AGENT_SPAN_PREFIX}{agent_name}"
-    assert attributes["au.span.kind"] == "agent"
-    assert attributes["au.agent.name"] == agent_name
-    assert attributes["au.agent.status"] == status
-    assert attributes["au.agent.pair_id"]
-    assert "au.agent.duration" in attributes
-    assert attributes["au.trace.caller_type"] == "user"
-    assert "au.trace.caller_name" in attributes
-    for key in _USAGE_KEYS:
-        assert key.format(layer=AGENT_LAYER) in attributes
-    assert ("au.agent.input" in attributes) is content
-    if status == "success":
-        assert ("au.agent.output" in attributes) is content
-    return attributes
+    return [name for name in names if not name.endswith("_errors_total")]
 
 
-def _assert_gen_ai_agent_span(
-    span: ReadableSpan, agent_name: str, content: bool = False
-) -> dict[str, Any]:
-    attributes = _attributes(span)
-    assert attributes["gen_ai.span.kind"] == "AGENT"
-    assert attributes["gen_ai.operation.name"] == "invoke_agent"
-    assert attributes["gen_ai.framework"] == "agentuniverse"
-    assert attributes["gen_ai.agent.name"] == agent_name
-    assert ("gen_ai.input.messages" in attributes) is content
-    return attributes
+def run_agent(agent: Any) -> Any:
+    return agent.run(input="hello")
 
 
-def _assert_au_llm_span(
-    span: ReadableSpan,
-    llm_name: str,
-    status: str = "success",
-    content: bool = True,
-) -> dict[str, Any]:
-    attributes = _attributes(span)
-    assert span.name == f"{AU_LLM_SPAN_PREFIX}{llm_name}"
-    assert attributes["au.span.kind"] == "llm"
-    assert attributes["au.llm.name"] == llm_name
-    assert attributes["au.llm.channel_name"] == "test_channel"
-    assert attributes["au.llm.status"] == status
-    assert "au.llm.duration" in attributes
-    assert "au.llm.llm_params" in attributes
-    assert attributes["au.trace.caller_type"] in ("agent", "user")
-    assert ("au.llm.input" in attributes) is content
-    if status == "success":
-        assert attributes["au.llm.streaming"] in (True, False)
-        assert "au.llm.first_token.duration" in attributes
-        for key in _USAGE_KEYS:
-            assert key.format(layer=LLM_LAYER) in attributes
-        assert ("au.llm.output" in attributes) is content
-    return attributes
+class SecretLLM(StubLLM):
+    """An LLM whose output carries a secret."""
+
+    name = "secret_llm"
+
+    @trace_llm
+    def call(self, prompt: str, **kwargs: Any) -> LLMOutput:
+        return LLMOutput(
+            text=f"echo {SECRET}",
+            usage=TokenUsage(text_in=3, text_out=5),
+            finish_reason="stop",
+        )
 
 
-def _assert_gen_ai_llm_span(
-    span: ReadableSpan, content: bool = False
-) -> dict[str, Any]:
-    attributes = _attributes(span)
-    assert attributes["gen_ai.span.kind"] == "LLM"
-    assert attributes["gen_ai.operation.name"] == "chat"
-    assert attributes["gen_ai.framework"] == "agentuniverse"
-    assert ("gen_ai.input.messages" in attributes) is content
-    assert ("gen_ai.output.messages" in attributes) is content
-    return attributes
+class SecretFailingLLM(StubLLM):
+    """An LLM that fails with a secret in its message."""
+
+    name = "secret_failing_llm"
+
+    @trace_llm
+    def call(self, prompt: str, **kwargs: Any) -> LLMOutput:
+        raise RuntimeError(f"llm failed on {SECRET}")
 
 
-def _assert_au_tool_span(
-    span: ReadableSpan,
-    tool_name: str,
-    status: str = "success",
-    content: bool = True,
-) -> dict[str, Any]:
-    attributes = _attributes(span)
-    assert span.name == f"{AU_TOOL_SPAN_PREFIX}{tool_name}"
-    assert attributes["au.span.kind"] == "tool"
-    assert attributes["au.tool.name"] == tool_name
-    assert attributes["au.tool.status"] == status
-    assert attributes["au.tool.pair_id"]
-    assert "au.tool.duration" in attributes
-    assert attributes["au.trace.caller_type"] in ("agent", "user")
-    for key in _USAGE_KEYS:
-        assert key.format(layer=TOOL_LAYER) in attributes
-    assert ("au.tool.input" in attributes) is content
-    if status == "success":
-        assert ("au.tool.output" in attributes) is content
-    return attributes
+class ExplodingStreamLLM(StubLLM):
+    """A streamed LLM that fails halfway through."""
+
+    name = "exploding_stream_llm"
+
+    @trace_llm
+    def call(self, prompt: str, **kwargs: Any):
+        yield LLMOutput(text="part-1")
+        raise RuntimeError("stream exploded")
 
 
-def _assert_gen_ai_tool_span(
-    span: ReadableSpan, tool_name: str, content: bool = False
-) -> dict[str, Any]:
-    attributes = _attributes(span)
-    assert attributes["gen_ai.span.kind"] == "TOOL"
-    assert attributes["gen_ai.operation.name"] == "execute_tool"
-    assert attributes["gen_ai.framework"] == "agentuniverse"
-    assert attributes["gen_ai.tool.name"] == tool_name
-    assert attributes["gen_ai.tool.type"] == "function"
-    assert attributes["gen_ai.tool.call.id"] == attributes["au.tool.pair_id"]
-    assert ("gen_ai.tool.call.arguments" in attributes) is content
-    assert ("gen_ai.tool.call.result" in attributes) is content
-    return attributes
+class SecretFailingTool(StubTool):
+    """A tool that fails with a secret in its message."""
+
+    name: str = "secret_failing_tool"
+
+    def execute(self, query: str) -> str:
+        raise RuntimeError(f"tool failed on {SECRET}")
 
 
-def _assert_no_content_on_the_layer(layer: str, span: ReadableSpan) -> None:
-    attributes = _attributes(span)
-    for key in _CONTENT_KEYS[layer]:
-        assert key not in attributes, f"{key} must not be exported"
+class SecretAgent(StubAgent):
+    """An agent whose LLM output and tool output carry a secret."""
+
+    def execute(self, input_object: Any, agent_input: dict) -> dict:
+        llm_output = SecretLLM().call(prompt=input_object.get_data("input"))
+        tool_output = StubTool().run(query=input_object.get_data("input"))
+        return {"output": f"{llm_output.text}|{tool_output}"}
 
 
-def _run_session_child() -> dict:
-    completed = subprocess.run(
-        [sys.executable, str(_SESSION_CHILD)],
-        capture_output=True,
-        text=True,
-        timeout=600,
-        cwd=str(Path(__file__).resolve().parents[1]),
-    )
-    assert completed.returncode == 0, completed.stderr
-    return json.loads(completed.stdout.strip().splitlines()[-1])
+class SecretFailingAgent(StubAgent):
+    """An agent that fails with a secret in its message."""
+
+    def execute(self, input_object: Any, agent_input: dict) -> dict:
+        raise RuntimeError(f"agent failed on {SECRET}")
+
+
+class SlowAsyncAgent(StubAgent):
+    """An agent that can be cancelled while it works."""
+
+    async def async_execute(
+        self, input_object: Any, agent_input: dict
+    ) -> dict:
+        await asyncio.sleep(5)
+        return {"output": "late"}
+
+
+class FailingStreamingAgent(StubAgent):
+    """An agent whose streaming body raises after the first token."""
+
+    def execute(self, input_object: Any, agent_input: dict) -> dict:
+        stream = input_object.get_data("output_stream")
+        if stream is not None:
+            stream.put("first-token")
+        raise RuntimeError("streaming agent exploded")
+
+
+def memory_spy(monkeypatch: Any, module: Any) -> list:
+    """Record conversation-memory calls, still running the real module."""
+    calls: list = []
+
+    class Spy:
+        def __init__(self) -> None:
+            self._real = RealConversationMemoryModule()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real, name)
+
+    for name in (
+        "add_agent_input_info",
+        "add_agent_result_info",
+        "add_tool_input_info",
+        "add_tool_output_info",
+    ):
+
+        def record(*args: Any, __name: str = name, **kwargs: Any) -> Any:
+            calls.append(__name)
+            return getattr(RealConversationMemoryModule(), __name)(
+                *args, **kwargs
+            )
+
+        setattr(Spy, name, record)
+    monkeypatch.setattr(module, "ConversationMemoryModule", Spy)
+    return calls
 
 
 # ---------------------------------------------------------------------------
-# Three-layer assembly: ownership and the single-span property
+# Install, suppression and restore
 # ---------------------------------------------------------------------------
 
 
-class TestThreeLayerAssembly:
-    def test_bridge_owns_all_three_layers_when_none_is_active(
-        self, tracer_provider, meter_provider
-    ):
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
+class TestInstallAndRestore:
+    def test_extension_points_start_at_the_framework_defaults(self) -> None:
+        for name in WRAPPER_GLOBALS:
+            wrapper = getattr(trace_module, name)
+            assert callable(wrapper), name
+            assert getattr(wrapper, "__self__", None) is None, name
+
+    def test_install_claims_all_six_extension_points(self) -> None:
+        instrumentor = AgentUniverseInstrumentor()
+        instrumentor.instrument(tracer_provider=None, meter_provider=None)
         try:
-            assert [layer.key for layer in bridge._layers] == list(_ALL_LAYERS)
-            assert all(layer.owned for layer in bridge._layers)
+            for name in WRAPPER_GLOBALS:
+                owner = getattr(trace_module, name).__self__
+                assert owner is not None, name
+                assert owner.__class__.__module__.startswith(
+                    "opentelemetry.instrumentation.agentuniverse"
+                ), name
+            assert instrumentor.installed_wrappers is not None
+            assert set(instrumentor.installed_wrappers) == set(WRAPPER_GLOBALS)
         finally:
-            bridge.uninstrument()
+            instrumentor.uninstrument()
 
-    def test_one_span_per_layer_with_both_namespaces(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
+    def test_uninstrument_restores_object_identity(self) -> None:
+        saved = {name: getattr(trace_module, name) for name in WRAPPER_GLOBALS}
+        instrumentor = AgentUniverseInstrumentor()
+        instrumentor.instrument()
         try:
-            result = build_agent("rich_agent", RichAgent).run(input="hello")
+            for name in WRAPPER_GLOBALS:
+                assert getattr(trace_module, name) is not saved[name]
         finally:
-            bridge.uninstrument()
+            instrumentor.uninstrument()
+        for name, original in saved.items():
+            assert getattr(trace_module, name) is original, name
 
-        assert result.get_data("output") == "llm:hello|tool-output:hello"
-        _assert_one_span_per_layer(span_exporter)
-        agent_span = _single_layer_span(span_exporter, AGENT_LAYER)
-        llm_span = _single_layer_span(span_exporter, LLM_LAYER)
-        tool_span = _single_layer_span(span_exporter, TOOL_LAYER)
-        _assert_au_agent_span(agent_span, "rich_agent", content=False)
-        _assert_gen_ai_agent_span(agent_span, "rich_agent")
-        _assert_au_llm_span(llm_span, "stub_llm", content=False)
-        _assert_gen_ai_llm_span(llm_span)
-        _assert_au_tool_span(tool_span, "stub_tool", content=False)
-        _assert_gen_ai_tool_span(tool_span, "stub_tool")
-
-    def test_llm_and_tool_spans_nest_under_the_agent_span(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
+    def test_double_instrument_does_not_double_wrap(
+        self, loongsuite_harness: Any
+    ) -> None:
+        instrumentor = AgentUniverseInstrumentor()
+        instrumentor.instrument()
+        instrumentor.instrument()
         try:
-            build_agent("rich_agent", RichAgent).run(input="hello")
+            rich = build_agent("rich_agent", RichAgent)
+            run_agent(rich)
+            assert len(layer_records(loongsuite_harness, AGENT_SPAN)) == 1
+            assert len(layer_records(loongsuite_harness, LLM_SPAN)) == 1
+            assert len(layer_records(loongsuite_harness, TOOL_SPAN)) == 1
         finally:
-            bridge.uninstrument()
+            instrumentor.uninstrument()
 
-        agent_span = _single_layer_span(span_exporter, AGENT_LAYER)
-        assert agent_span.parent is None
-        for layer in (LLM_LAYER, TOOL_LAYER):
-            span = _single_layer_span(span_exporter, layer)
-            assert span.parent is not None
-            assert span.parent.span_id == agent_span.context.span_id
+    def test_uninstrument_twice_is_safe(self) -> None:
+        instrumentor = AgentUniverseInstrumentor()
+        instrumentor.instrument()
+        instrumentor.uninstrument()
+        instrumentor.uninstrument()
 
-    def test_native_only_creates_one_span_per_layer_without_gen_ai(
-        self, tracer_provider, span_exporter
-    ):
-        natives = _instrument_all_natives(tracer_provider)
-        try:
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            for native in natives:
-                native.uninstrument()
+    def test_failed_install_rolls_back_every_extension_point(
+        self, monkeypatch: Any
+    ) -> None:
+        saved = {name: getattr(trace_module, name) for name in WRAPPER_GLOBALS}
+        instrumentor = AgentUniverseInstrumentor()
+        calls = {"count": 0}
+        original = instrumentor._install_wrapper
 
-        _assert_one_span_per_layer(span_exporter)
-        # The native layers write their content unconditionally; the bridge is
-        # not installed here, so nothing filters or augments them.
-        _assert_au_agent_span(
-            _single_layer_span(span_exporter, AGENT_LAYER), "rich_agent"
-        )
-        _assert_au_llm_span(
-            _single_layer_span(span_exporter, LLM_LAYER), "stub_llm"
-        )
-        _assert_au_tool_span(
-            _single_layer_span(span_exporter, TOOL_LAYER), "stub_tool"
-        )
-        for span in _spans(span_exporter):
-            assert not _has_gen_ai_attributes(span), span.name
+        def flaky(name: str, wrapper: Any) -> None:
+            calls["count"] += 1
+            if calls["count"] == 3:
+                raise RuntimeError("boom")
+            original(name, wrapper)
 
-    def test_both_enabled_keeps_one_span_per_layer(
-        self, tracer_provider, span_exporter, meter_provider, metric_reader
-    ):
-        natives = _instrument_all_natives(tracer_provider, meter_provider)
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            # Reuse, never a second construction: a native instrumentor's
-            # __init__ resets the wrapper originals and the metric recorder it
-            # is already serving calls with.
-            for layer, native in zip(bridge._layers, natives):
-                assert layer.owned is False
-                assert layer.native is native
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
-            for native in natives:
-                native.uninstrument()
+        monkeypatch.setattr(instrumentor, "_install_wrapper", flaky)
+        instrumentor.instrument()
+        for name, value in saved.items():
+            assert getattr(trace_module, name) is value, name
+        assert not instrumentor.__dict__.get(
+            "_is_instrumented_by_opentelemetry"
+        )
 
-        _assert_one_span_per_layer(span_exporter)
-        _assert_gen_ai_agent_span(
-            _single_layer_span(span_exporter, AGENT_LAYER), "rich_agent"
-        )
-        _assert_gen_ai_llm_span(_single_layer_span(span_exporter, LLM_LAYER))
-        _assert_gen_ai_tool_span(
-            _single_layer_span(span_exporter, TOOL_LAYER), "stub_tool"
-        )
-        # One call per layer: a second native instrumentor would double these.
+    def test_native_then_loongsuite_restores_native_wrappers(
+        self, configured_providers: Any
+    ) -> None:
+        provider, meter_provider, _reader = configured_providers
+        enabled = enable_native_instrumentors(provider, meter_provider)
+        native = {
+            name: getattr(trace_module, name) for name in WRAPPER_GLOBALS
+        }
+        instrumentor = AgentUniverseInstrumentor()
+        instrumentor.instrument()
         assert (
-            _counter(
-                metric_reader, "agent_calls_total", au_agent_name="rich_agent"
-            )
-            == 1
+            getattr(trace_module, "_agent_wrapper_sync")
+            is not native["_agent_wrapper_sync"]
         )
-        assert (
-            _counter(metric_reader, "llm_calls_total", au_llm_name="stub_llm")
-            == 1
+        instrumentor.uninstrument()
+        for name, wrapper in native.items():
+            assert getattr(trace_module, name) is wrapper, name
+        for instrumentor_ in enabled:
+            instrumentor_.uninstrument()
+
+    def test_restored_native_wrappers_still_work(
+        self, configured_providers: Any
+    ) -> None:
+        provider, meter_provider, _reader = configured_providers
+        enabled = enable_native_instrumentors(provider, meter_provider)
+        instrumentor = AgentUniverseInstrumentor()
+        instrumentor.instrument()
+        instrumentor.uninstrument()
+        run_agent(build_agent("native_after_restore"))
+        instrumentor.instrument()
+        run_agent(build_agent("loongsuite_after_restore"))
+        for instrumentor_ in enabled:
+            instrumentor_.uninstrument()
+
+    def test_late_native_override_is_not_clobbered(
+        self, configured_providers: Any
+    ) -> None:
+        from agentuniverse.base.tracing.otel.instrumentation.agent.agent_instrumentor import (  # noqa: E501
+            AgentInstrumentor,
         )
-        assert (
-            _counter(
-                metric_reader, "tool_calls_total", au_tool_name="stub_tool"
-            )
-            == 1
+
+        provider, meter_provider, _reader = configured_providers
+        instrumentor = AgentUniverseInstrumentor()
+        instrumentor.instrument()
+        native_agent = active_native_instrumentor(AgentInstrumentor)
+        assert native_agent is None, (
+            "the native agent instrumentor was already on"
         )
-
-    def test_partial_ownership_reuses_only_the_agent_layer(
-        self, tracer_provider, span_exporter
-    ):
-        native_agent = _instrument_native(AGENT_LAYER, tracer_provider)
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            ownership = {layer.key: layer.owned for layer in bridge._layers}
-            assert ownership == {
-                AGENT_LAYER: False,
-                LLM_LAYER: True,
-                TOOL_LAYER: True,
-            }
-            assert bridge._layers[0].native is native_agent
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
-            native_agent.uninstrument()
-
-        _assert_one_span_per_layer(span_exporter)
-        for layer in _ALL_LAYERS:
-            assert _has_gen_ai_attributes(
-                _single_layer_span(span_exporter, layer)
+        native_agent = AgentInstrumentor()
+        native_agent.instrument(
+            tracer_provider=provider, meter_provider=meter_provider
+        )
+        late = {
+            name: getattr(trace_module, name)
+            for name in ("_agent_wrapper_sync", "_agent_wrapper_async")
+        }
+        assert getattr(late["_agent_wrapper_sync"], "__self__") is native_agent
+        instrumentor.uninstrument()
+        for name, wrapper in late.items():
+            assert getattr(trace_module, name) is wrapper, (
+                f"{name} was restored by LoongSuite even though another "
+                "instrumentation had replaced it"
             )
+        native_agent.uninstrument()
 
-    def test_partial_ownership_reuses_only_the_llm_layer(
-        self, tracer_provider, span_exporter
-    ):
-        native_llm = _instrument_native(LLM_LAYER, tracer_provider)
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            ownership = {layer.key: layer.owned for layer in bridge._layers}
-            assert ownership == {
-                AGENT_LAYER: True,
-                LLM_LAYER: False,
-                TOOL_LAYER: True,
-            }
-            assert bridge._layers[1].native is native_llm
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
-            native_llm.uninstrument()
-
-        _assert_one_span_per_layer(span_exporter)
-        for layer in _ALL_LAYERS:
-            assert _has_gen_ai_attributes(
-                _single_layer_span(span_exporter, layer)
-            )
+    def test_instrumentor_exposes_its_layer_globals(self) -> None:
+        instrumentor = AgentUniverseInstrumentor()
+        assert {tuple(pair) for pair in instrumentor.layer_globals} == {
+            ("_agent_wrapper_sync", "_agent_wrapper_async"),
+            ("_llm_wrapper_sync", "_llm_wrapper_async"),
+            ("_tool_wrapper_sync", "_tool_wrapper_async"),
+        }
 
 
 # ---------------------------------------------------------------------------
-# The bridge delegates: the native wrappers stay the span owners
-# ---------------------------------------------------------------------------
-
-
-def test_bridge_does_not_wrap_framework_entry_points(tracer_provider):
-    from agentuniverse.agent.action.tool.tool import Tool
-    from agentuniverse.agent.agent import Agent
-
-    run_before = Agent.run
-    async_run_before = Agent.async_run
-    tool_run_before = Tool.run
-    tool_async_run_before = Tool.async_run
-
-    bridge = _instrument_bridge(tracer_provider)
-    try:
-        assert Agent.run is run_before
-        assert Agent.async_run is async_run_before
-        assert Tool.run is tool_run_before
-        assert Tool.async_run is tool_async_run_before
-        # Every layer's span comes from a native instrumentor, not from here.
-        for native_cls in NATIVE_LAYER_GLOBALS:
-            assert active_native_instrumentor(native_cls) is not None
-    finally:
-        bridge.uninstrument()
-
-
-def test_loongsuite_only_agent_span_carries_both_namespaces(
-    tracer_provider, span_exporter, make_agent
-):
-    bridge = _instrument_bridge(tracer_provider)
-    try:
-        make_agent().run(input="hello")
-    finally:
-        bridge.uninstrument()
-
-    span = _single_span(span_exporter)
-    _assert_au_agent_span(span, "test_agent", content=False)
-    _assert_gen_ai_agent_span(span, "test_agent")
-
-
-# ---------------------------------------------------------------------------
-# The agent layer
+# Agent layer
 # ---------------------------------------------------------------------------
 
 
 class TestAgentLayer:
-    def test_error_span_keeps_the_native_error_attributes(
-        self, tracer_provider, span_exporter, make_agent
-    ):
-        agent = make_agent("boom_agent", FailingAgent)
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            with pytest.raises(RuntimeError, match="agent exploded"):
-                agent.run(input="hello")
-        finally:
-            bridge.uninstrument()
+    def test_sync_run_creates_one_span(self, loongsuite_harness: Any) -> None:
+        run_agent(build_agent("test_agent"))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert record.name == "au.agent.test_agent"
+        assert record.kind == "INTERNAL"
+        assert record.status == "UNSET"
+        assert record.parent is None
 
-        span = _single_span(span_exporter)
-        assert span.status.status_code == StatusCode.ERROR
-        attributes = _assert_au_agent_span(
-            span, "boom_agent", status="error", content=False
-        )
-        assert attributes["au.agent.error.type"] == "RuntimeError"
-        assert "agent exploded" in attributes["au.agent.error.message"]
-        assert attributes["error.type"] == "RuntimeError"
-        _assert_gen_ai_agent_span(span, "boom_agent")
-
-    def test_error_is_counted_once(
-        self, tracer_provider, meter_provider, metric_reader, make_agent
-    ):
-        agent = make_agent("boom_agent", FailingAgent)
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            with pytest.raises(RuntimeError):
-                agent.run(input="hello")
-        finally:
-            bridge.uninstrument()
-
+    def test_span_carries_the_full_native_attribute_set(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_on():
+            run_agent(build_agent("test_agent"))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert set(record.au) == AGENT_AU_KEYS
+        assert record.au["au.span.kind"] == "agent"
+        assert record.au["au.agent.name"] == "test_agent"
+        assert record.au["au.agent.status"] == "success"
+        assert record.au["au.agent.streaming"] is False
+        assert record.au["au.agent.duration"] >= 0
+        assert record.au["au.trace.caller_type"] == "user"
+        assert json.loads(record.au["au.agent.input"]) == {
+            "kwargs": {"input": "hello"}
+        }
+        assert "echo:hello" in record.au["au.agent.output"]
         assert (
-            _counter(
-                metric_reader,
-                "agent_errors_total",
-                au_agent_name="boom_agent",
-            )
-            == 1
+            json.loads(record.au["au.agent.output"])["output"] == "echo:hello"
         )
 
-    def test_streaming_records_the_first_token(
-        self,
-        tracer_provider,
-        meter_provider,
-        metric_reader,
-        span_exporter,
-        make_agent,
-    ):
-        agent = make_agent("stream_agent", StreamingAgent)
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            result = agent.run(input="hello", output_stream=queue.Queue())
-        finally:
-            bridge.uninstrument()
+    def test_span_carries_gen_ai_attributes(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_on():
+            run_agent(build_agent("test_agent"))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert {
+            "gen_ai.operation.name",
+            "gen_ai.span.kind",
+            "gen_ai.agent.name",
+            "gen_ai.framework",
+        } <= set(record.gen_ai)
+        assert record.gen_ai["gen_ai.operation.name"] == "invoke_agent"
+        assert record.gen_ai["gen_ai.span.kind"] == "AGENT"
+        assert record.gen_ai["gen_ai.agent.name"] == "test_agent"
+        assert record.gen_ai["gen_ai.framework"] == "agentuniverse"
 
-        assert result.get_data("output") == "streamed"
-        span = _single_span(span_exporter)
-        attributes = _assert_au_agent_span(span, "stream_agent", content=False)
-        assert attributes["au.agent.streaming"] is True
-        assert attributes["au.agent.first_token.duration"] > 0
-        _assert_gen_ai_agent_span(span, "stream_agent")
+    def test_async_run_matches_sync(self, loongsuite_harness: Any) -> None:
+        agent = build_agent("async_agent")
+        asyncio.run(agent.async_run(input="hello"))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert record.name == "au.agent.async_agent"
+        assert record.au["au.agent.status"] == "success"
 
-        # On the streaming path the native wrapper records the first token from
-        # the queue callback, so this data point can only come from there.
-        point = _only_point(
-            metric_reader,
+    def test_all_nine_agent_metrics_are_recorded(
+        self, loongsuite_harness: Any
+    ) -> None:
+        run_agent(build_agent("test_agent"))
+        metrics = loongsuite_harness.metrics()
+        for name in recorded_on_success(AGENT_METRICS):
+            assert baseline.points_for(
+                metrics, name, au_agent_name="test_agent"
+            ), name
+        calls = baseline.points_for(
+            metrics, "agent_calls_total", au_agent_name="test_agent"
+        )
+        assert len(calls) == 1 and calls[0].value == 1
+        assert set(calls[0].labels) == {
+            "au_agent_name",
+            "au_trace_caller_name",
+            "au_trace_caller_type",
+            "au_agent_status",
+        }
+        for name in AGENT_METRICS[2:]:
+            point = baseline.points_for(
+                metrics, name, au_agent_name="test_agent"
+            )[0]
+            assert "au_agent_streaming" in point.labels, name
+
+    def test_streaming_agent_first_token_is_positive(
+        self, loongsuite_harness: Any
+    ) -> None:
+        agent = build_agent("stream_agent", StreamingAgent)
+        run_agent_with_stream(agent)
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert record.au["au.agent.streaming"] is True
+        assert record.au["au.agent.first_token.duration"] > 0
+        assert record.gen_ai["gen_ai.response.time_to_first_token"] > 0
+        metrics = loongsuite_harness.metrics()
+        point = baseline.points_for(
+            metrics,
             "agent_first_token_duration",
             au_agent_name="stream_agent",
-        )
-        assert point.count == 1
-        assert point.attributes["au_agent_streaming"] is True
-        assert point.sum > 0
+        )[0]
+        assert point.value > 0
+        assert point.labels["au_agent_streaming"] is True
 
-    def test_token_usage_attributes_stay_on_the_span(
-        self, tracer_provider, span_exporter, make_agent
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            make_agent().run(input="hello")
-        finally:
-            bridge.uninstrument()
-
-        attributes = _attributes(_single_span(span_exporter))
-        # A stub agent makes no LLM call, so the native totals are zero -- the
-        # point is that the attributes are there and keep their native shape.
-        assert attributes["au.agent.usage.total_tokens"] == 0
-        assert attributes["au.agent.usage.prompt_tokens"] == 0
-        assert attributes["au.agent.usage.completion_tokens"] == 0
-        assert set(json.loads(attributes["au.agent.usage.detail_tokens"])) == {
-            "prompt_tokens",
-            "completion_tokens",
-            "total_tokens",
-        }
-
-    def test_metrics_family_is_complete_and_recorded_once(
-        self, tracer_provider, meter_provider, metric_reader, make_agent
-    ):
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            make_agent().run(input="hello")
-        finally:
-            bridge.uninstrument()
-
-        collected = _collect_metrics(metric_reader)
-        for name in _METRIC_NAMES[AGENT_LAYER]:
-            if name == "agent_errors_total":
-                continue  # only an error produces this one
-            assert name in collected, f"{name} was never recorded"
+    def test_error_run_records_status_attribute_and_metric(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with pytest.raises(RuntimeError):
+            run_agent(build_agent("boom_agent", FailingAgent))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert record.status == "ERROR"
+        assert record.au["au.agent.status"] == "error"
+        assert record.au["au.agent.error.type"] == "RuntimeError"
+        # Content capture is off here, so the message is the type alone;
+        # the captured form is asserted by the privacy tests.
+        assert record.au["au.agent.error.message"] == "RuntimeError"
+        metrics = loongsuite_harness.metrics()
         assert (
-            _counter(
-                metric_reader, "agent_calls_total", au_agent_name="test_agent"
+            baseline.counter_value(
+                metrics,
+                "agent_errors_total",
+                au_agent_name="boom_agent",
+                au_agent_status="RuntimeError",
             )
             == 1
         )
-        # The duration is recorded once. Its value is not asserted positive:
-        # ``time.time()`` on Windows only resolves to about 15 ms and this
-        # agent body does no work.
-        assert (
-            _only_point(
-                metric_reader,
-                "agent_call_duration",
-                au_agent_name="test_agent",
-            ).count
-            == 1
-        )
-        assert (
-            _histogram_sum(
-                metric_reader, "agent_total_tokens", au_agent_name="test_agent"
-            )
-            == 0
-        )
+
+    def test_conversation_memory_receives_input_and_result(
+        self, loongsuite_harness: Any, monkeypatch: Any
+    ) -> None:
+        calls = memory_spy(monkeypatch, agent_layer)
+        run_agent(build_agent("memory_agent"))
+        assert "add_agent_input_info" in calls
+        assert "add_agent_result_info" in calls
 
 
-@pytest.mark.asyncio
-async def test_async_run_produces_one_span_per_layer(
-    tracer_provider, span_exporter
-):
-    bridge = _instrument_bridge(tracer_provider)
-    try:
-        result = await build_agent("async_agent", AsyncRichAgent).async_run(
-            input="hello async"
-        )
-    finally:
-        bridge.uninstrument()
-
-    assert (
-        result.get_data("output")
-        == "async:hello async|tool-output:hello async"
-    )
-    assert sorted(span.name for span in _spans(span_exporter)) == [
-        "au.agent.async_agent",
-        "au.llm.async_llm",
-        "au.tool.stub_tool",
-    ]
-    _assert_au_agent_span(
-        _single_layer_span(span_exporter, AGENT_LAYER),
-        "async_agent",
-        content=False,
-    )
-    _assert_gen_ai_agent_span(
-        _single_layer_span(span_exporter, AGENT_LAYER), "async_agent"
-    )
-    _assert_gen_ai_llm_span(_single_layer_span(span_exporter, LLM_LAYER))
-    _assert_gen_ai_tool_span(
-        _single_layer_span(span_exporter, TOOL_LAYER), "stub_tool"
-    )
+def run_agent_with_stream(agent: Any) -> Any:
+    stream: queue.Queue = queue.Queue()
+    return agent.run(input="hello", output_stream=stream)
 
 
 # ---------------------------------------------------------------------------
-# The LLM layer
+# LLM layer
 # ---------------------------------------------------------------------------
 
 
 class TestLLMLayer:
-    def test_native_only_llm_span_has_no_gen_ai(
-        self, tracer_provider, span_exporter
-    ):
-        native = _instrument_native(LLM_LAYER, tracer_provider)
-        try:
+    def test_sync_call_creates_one_span(self, loongsuite_harness: Any) -> None:
+        with capture_on():
             StubLLM().call(prompt="hello")
-        finally:
-            native.uninstrument()
-
-        span = _single_span(span_exporter)
-        attributes = _assert_au_llm_span(span, "stub_llm")
-        assert attributes["au.llm.output"] == "llm:hello"
-        assert not _has_gen_ai_attributes(span)
-
-    def test_llm_span_carries_both_namespaces(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            StubLLM().call(prompt="hello")
-        finally:
-            bridge.uninstrument()
-
-        span = _single_span(span_exporter)
-        _assert_au_llm_span(span, "stub_llm", content=False)
-        attributes = _assert_gen_ai_llm_span(span)
-        # Token usage is mirrored from the native counters, so the two
-        # namespaces cannot disagree.
-        assert attributes["gen_ai.usage.input_tokens"] == 3
-        assert attributes["gen_ai.usage.output_tokens"] == 5
-        assert attributes["gen_ai.usage.total_tokens"] == 8
-
-    def test_messages_input_becomes_a_gen_ai_input_message(
-        self, tracer_provider, span_exporter, monkeypatch
-    ):
-        monkeypatch.setenv(_CONTENT_ENV, "SPAN_ONLY")
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            MessagesLLM().call(messages=[{"role": "user", "content": "hi"}])
-        finally:
-            bridge.uninstrument()
-
-        attributes = _attributes(_single_span(span_exporter))
-        assert json.loads(attributes["gen_ai.input.messages"]) == [
-            {"role": "user", "parts": [{"type": "text", "content": "hi"}]}
-        ]
-        # The native carrier keeps the caller's arguments, plus the empty
-        # ``kwargs`` that ``inspect.signature().bind()`` fills in.
-        assert json.loads(attributes["au.llm.input"])["messages"] == [
-            {"role": "user", "content": "hi"}
-        ]
-
-    def test_prompt_input_becomes_a_gen_ai_input_message(
-        self, tracer_provider, span_exporter, monkeypatch
-    ):
-        monkeypatch.setenv(_CONTENT_ENV, "SPAN_ONLY")
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            StubLLM().call(prompt="hello")
-        finally:
-            bridge.uninstrument()
-
-        attributes = _attributes(_single_span(span_exporter))
-        assert json.loads(attributes["gen_ai.input.messages"]) == _USER_MESSAGE
-        assert json.loads(attributes["gen_ai.output.messages"])[0][
-            "parts"
-        ] == [{"type": "text", "content": "llm:hello"}]
-
-    def test_temperature_is_mirrored_when_the_caller_sets_it(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            StubLLM().call(prompt="hello", temperature=0.5)
-        finally:
-            bridge.uninstrument()
-
-        attributes = _attributes(_single_span(span_exporter))
-        assert attributes["gen_ai.request.temperature"] == 0.5
-        assert json.loads(attributes["au.llm.llm_params"]) == {
-            "temperature": 0.5
+        record = one_layer_record(loongsuite_harness, LLM_SPAN)
+        assert record.name == "au.llm.stub_llm"
+        assert record.kind == "INTERNAL"
+        assert set(record.au) == LLM_AU_KEYS
+        assert record.au["au.span.kind"] == "llm"
+        assert record.au["au.llm.channel_name"] == "test_channel"
+        assert record.au["au.llm.streaming"] is False
+        assert record.au["au.llm.output"] == "llm:hello"
+        # The framework's own helper reports its -1 sentinel for a
+        # configured temperature; the baseline tests pin that this package
+        # reports the same payload.
+        assert set(json.loads(record.au["au.llm.llm_params"])) == {
+            "temperature"
         }
 
-    def test_the_native_temperature_sentinel_is_not_exported(
-        self, tracer_provider, span_exporter
-    ):
-        # ``_get_llm_info`` overwrites a channel-model temperature with -1
-        # unless the caller passes one, and -1 means "unknown" -- it must not
-        # reach the GenAI attribute.
-        bridge = _instrument_bridge(tracer_provider)
-        try:
+    def test_span_carries_gen_ai_attributes(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_on():
             StubLLM().call(prompt="hello")
-        finally:
-            bridge.uninstrument()
+        record = one_layer_record(loongsuite_harness, LLM_SPAN)
+        assert {
+            "gen_ai.operation.name",
+            "gen_ai.span.kind",
+            "gen_ai.request.model",
+            "gen_ai.provider.name",
+            "gen_ai.framework",
+        } <= set(record.gen_ai)
+        assert record.gen_ai["gen_ai.operation.name"] == "chat"
+        assert record.gen_ai["gen_ai.span.kind"] == "LLM"
 
-        attributes = _attributes(_single_span(span_exporter))
-        assert json.loads(attributes["au.llm.llm_params"]) == {
-            "temperature": -1
+    def test_all_nine_llm_metrics_are_recorded(
+        self, loongsuite_harness: Any
+    ) -> None:
+        StubLLM().call(prompt="hello")
+        metrics = loongsuite_harness.metrics()
+        for name in recorded_on_success(LLM_METRICS):
+            assert baseline.points_for(
+                metrics, name, au_llm_name="stub_llm"
+            ), name
+        calls = baseline.points_for(
+            metrics, "llm_calls_total", au_llm_name="stub_llm"
+        )
+        assert len(calls) == 1 and calls[0].value == 1
+        assert set(calls[0].labels) == {
+            "au_llm_name",
+            "au_trace_caller_name",
+            "au_trace_caller_type",
+            "au_llm_status",
         }
-        assert "gen_ai.request.temperature" not in attributes
+        first_token = baseline.points_for(
+            metrics, "llm_first_token_duration", au_llm_name="stub_llm"
+        )[0]
+        assert first_token.labels["au_llm_streaming"] is False
 
-    def test_streaming_first_token_is_positive_on_both_namespaces(
-        self, tracer_provider, span_exporter, meter_provider, metric_reader
-    ):
-        agent = build_agent("stream_llm_agent", StreamingLLMAgent)
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            agent.run(input="hello")
-        finally:
-            bridge.uninstrument()
+    def test_async_call_creates_one_span(
+        self, loongsuite_harness: Any
+    ) -> None:
+        from .conftest import AsyncLLM
 
-        span = _single_layer_span(span_exporter, LLM_LAYER)
-        attributes = _assert_au_llm_span(span, "stream_llm", content=False)
-        assert attributes["au.llm.streaming"] is True
-        assert attributes["au.llm.first_token.duration"] > 0
-        assert attributes["gen_ai.response.time_to_first_token"] > 0
-        _assert_gen_ai_llm_span(span)
+        with capture_on():
+            asyncio.run(AsyncLLM().call(prompt="hello"))
+        record = one_layer_record(loongsuite_harness, LLM_SPAN)
+        assert record.name == "au.llm.async_llm"
+        assert record.au["au.llm.output"] == "async:hello"
 
-        point = _only_point(
-            metric_reader, "llm_first_token_duration", au_llm_name="stream_llm"
-        )
-        assert point.attributes["au_llm_streaming"] is True
-        assert point.sum > 0
+    def test_stream_span_is_held_until_the_stream_is_consumed(
+        self, loongsuite_harness: Any
+    ) -> None:
+        stream = StreamingLLM().call(prompt="hello")
+        assert loongsuite_harness.spans() == []
+        chunks = list(stream)
+        assert len(chunks) == 2
+        record = one_layer_record(loongsuite_harness, LLM_SPAN)
+        assert record.au["au.llm.streaming"] is True
+        assert record.au["au.llm.status"] == "success"
+        assert record.au["au.llm.first_token.duration"] >= 0
+        assert record.gen_ai["gen_ai.response.time_to_first_token"] >= 0
 
-    def test_error_span_keeps_the_native_error_attributes(
-        self, tracer_provider, span_exporter, meter_provider, metric_reader
-    ):
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            with pytest.raises(RuntimeError, match="llm exploded"):
-                FailingLLM().call(prompt="hello")
-        finally:
-            bridge.uninstrument()
+    def test_stream_usage_is_counted_once(
+        self, loongsuite_harness: Any
+    ) -> None:
+        list(StreamingLLM().call(prompt="hello"))
+        record = one_layer_record(loongsuite_harness, LLM_SPAN)
+        assert record.au["au.llm.usage.total_tokens"] == 10
+        metrics = loongsuite_harness.metrics()
+        assert baseline.histogram_values(
+            metrics, "llm_total_tokens", au_llm_name="stream_llm"
+        ) == [10]
 
-        span = _single_span(span_exporter)
-        assert span.status.status_code == StatusCode.ERROR
-        attributes = _assert_au_llm_span(
-            span, "failing_llm", status="error", content=False
-        )
-        assert attributes["au.llm.error.type"] == "RuntimeError"
-        assert "llm exploded" in attributes["au.llm.error.message"]
-        assert attributes["error.type"] == "RuntimeError"
-        _assert_gen_ai_llm_span(span)
+    def test_stream_closed_early_finalizes_once(
+        self, loongsuite_harness: Any
+    ) -> None:
+        stream = StreamingLLM().call(prompt="hello")
+        next(stream)
+        stream.close()
+        records = layer_records(loongsuite_harness, LLM_SPAN)
+        assert len(records) == 1
+        assert records[0].au["au.llm.status"] == "success"
+
+    def test_stream_error_finalizes_once_with_error_status(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with pytest.raises(RuntimeError):
+            list(ExplodingStreamLLM().call(prompt="hello"))
+        records = layer_records(loongsuite_harness, LLM_SPAN)
+        assert len(records) == 1
+        assert records[0].status == "ERROR"
+        assert records[0].au["au.llm.error.type"] == "RuntimeError"
+        metrics = loongsuite_harness.metrics()
         assert (
-            _counter(
-                metric_reader, "llm_errors_total", au_llm_name="failing_llm"
+            baseline.counter_value(
+                metrics,
+                "llm_errors_total",
+                au_llm_name="exploding_stream_llm",
             )
             == 1
         )
 
-    def test_metrics_are_recorded_once(
-        self, tracer_provider, span_exporter, meter_provider, metric_reader
-    ):
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            StubLLM().call(prompt="hello")
-        finally:
-            bridge.uninstrument()
-
-        collected = _collect_metrics(metric_reader)
-        for name in _METRIC_NAMES[LLM_LAYER]:
-            if name == "llm_errors_total":
-                continue  # only an error produces this one
-            assert name in collected, f"{name} was never recorded"
+    def test_error_call_records_status_and_metric(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with pytest.raises(RuntimeError):
+            FailingLLM().call(prompt="hello")
+        record = one_layer_record(loongsuite_harness, LLM_SPAN)
+        assert record.status == "ERROR"
+        assert record.au["au.llm.error.type"] == "RuntimeError"
+        assert "au.llm.input" not in record.au
+        assert "au.llm.output" not in record.au
+        metrics = loongsuite_harness.metrics()
         assert (
-            _counter(metric_reader, "llm_calls_total", au_llm_name="stub_llm")
+            baseline.counter_value(
+                metrics, "llm_errors_total", au_llm_name="failing_llm"
+            )
             == 1
         )
-        assert (
-            _histogram_sum(
-                metric_reader, "llm_total_tokens", au_llm_name="stub_llm"
-            )
-            == 8
-        )
-        assert (
-            _histogram_sum(
-                metric_reader, "llm_prompt_tokens", au_llm_name="stub_llm"
-            )
-            == 3
-        )
-        assert (
-            _histogram_sum(
-                metric_reader, "llm_completion_tokens", au_llm_name="stub_llm"
-            )
-            == 5
-        )
 
-    @pytest.mark.asyncio
-    async def test_async_llm_call_produces_one_span(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            result = await AsyncLLM().call(prompt="hello")
-        finally:
-            bridge.uninstrument()
+    def test_llm_plugin_hook_is_applied(
+        self, loongsuite_harness: Any, monkeypatch: Any
+    ) -> None:
+        calls = {"count": 0}
+        original = trace_module._llm_plugins
 
-        assert result.text == "async:hello"
-        span = _single_span(span_exporter)
-        attributes = _assert_au_llm_span(span, "async_llm", content=False)
-        assert attributes["au.llm.usage.total_tokens"] == 6
-        _assert_gen_ai_llm_span(span)
+        def spy(func: Any) -> Any:
+            calls["count"] += 1
+            return original(func)
+
+        monkeypatch.setattr(trace_module, "_llm_plugins", spy)
+        StubLLM().call(prompt="hello")
+        assert calls["count"] == 1
+        assert (
+            one_layer_record(loongsuite_harness, LLM_SPAN).au["au.llm.status"]
+            == "success"
+        )
 
 
 # ---------------------------------------------------------------------------
-# The tool layer
+# Tool layer
 # ---------------------------------------------------------------------------
 
 
 class TestToolLayer:
-    def test_native_only_tool_span_has_no_gen_ai(
-        self, tracer_provider, span_exporter
-    ):
-        native = _instrument_native(TOOL_LAYER, tracer_provider)
-        try:
-            result = StubTool().run(query="hello")
-        finally:
-            native.uninstrument()
-
-        assert result == "tool-output:hello"
-        span = _single_span(span_exporter)
-        attributes = _assert_au_tool_span(span, "stub_tool")
-        assert json.loads(attributes["au.tool.output"]) == "tool-output:hello"
-        assert not _has_gen_ai_attributes(span)
-
-    def test_tool_span_carries_both_namespaces(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
+    def test_sync_run_creates_one_span(self, loongsuite_harness: Any) -> None:
+        with capture_on():
             StubTool().run(query="hello")
-        finally:
-            bridge.uninstrument()
-
-        span = _single_span(span_exporter)
-        _assert_au_tool_span(span, "stub_tool", content=False)
-        _assert_gen_ai_tool_span(span, "stub_tool")
-
-    def test_a_tool_with_no_usage_gets_no_gen_ai_usage_attributes(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            StubTool().run(query="hello")
-        finally:
-            bridge.uninstrument()
-
-        attributes = _attributes(_single_span(span_exporter))
-        assert attributes["au.tool.usage.total_tokens"] == 0
-        assert "gen_ai.usage.total_tokens" not in attributes
-        assert "gen_ai.usage.input_tokens" not in attributes
-
-    def test_tool_error_span_keeps_the_native_error_attributes(
-        self, tracer_provider, span_exporter, meter_provider, metric_reader
-    ):
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            with pytest.raises(RuntimeError, match="tool exploded"):
-                FailingTool().run(query="hello")
-        finally:
-            bridge.uninstrument()
-
-        span = _single_span(span_exporter)
-        assert span.status.status_code == StatusCode.ERROR
-        attributes = _assert_au_tool_span(
-            span, "failing_tool", status="error", content=False
-        )
-        assert attributes["au.tool.error.type"] == "RuntimeError"
-        assert attributes["error.type"] == "RuntimeError"
-        _assert_gen_ai_tool_span(span, "failing_tool")
+        record = one_layer_record(loongsuite_harness, TOOL_SPAN)
+        assert record.name == "au.tool.stub_tool"
+        assert record.kind == "INTERNAL"
+        assert set(record.au) == TOOL_AU_KEYS
+        assert record.au["au.span.kind"] == "tool"
         assert (
-            _counter(
-                metric_reader, "tool_errors_total", au_tool_name="failing_tool"
+            json.loads(record.au["au.tool.input"])["kwargs"]["query"]
+            == "hello"
+        )
+        assert json.loads(record.au["au.tool.output"]) == "tool-output:hello"
+        assert record.au["au.tool.status"] == "success"
+        assert record.au["au.tool.pair_id"].startswith("tool_")
+
+    def test_span_carries_gen_ai_attributes(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_on():
+            StubTool().run(query="hello")
+        record = one_layer_record(loongsuite_harness, TOOL_SPAN)
+        assert {
+            "gen_ai.operation.name",
+            "gen_ai.span.kind",
+            "gen_ai.tool.name",
+            "gen_ai.framework",
+        } <= set(record.gen_ai)
+        assert record.gen_ai["gen_ai.operation.name"] == "execute_tool"
+        assert record.gen_ai["gen_ai.span.kind"] == "TOOL"
+        assert record.gen_ai["gen_ai.tool.name"] == "stub_tool"
+
+    def test_all_eight_tool_metrics_are_recorded(
+        self, loongsuite_harness: Any
+    ) -> None:
+        StubTool().run(query="hello")
+        metrics = loongsuite_harness.metrics()
+        for name in recorded_on_success(TOOL_METRICS):
+            assert baseline.points_for(
+                metrics, name, au_tool_name="stub_tool"
+            ), name
+        calls = baseline.points_for(
+            metrics, "tool_calls_total", au_tool_name="stub_tool"
+        )
+        assert len(calls) == 1 and calls[0].value == 1
+        assert set(calls[0].labels) == {
+            "au_tool_name",
+            "au_trace_caller_name",
+            "au_trace_caller_type",
+            "au_tool_status",
+        }
+        assert "au_tool_streaming" not in calls[0].labels
+
+    def test_async_run_creates_one_span(self, loongsuite_harness: Any) -> None:
+        with capture_on():
+            asyncio.run(StubTool().async_run(query="hello"))
+        record = one_layer_record(loongsuite_harness, TOOL_SPAN)
+        assert record.au["au.tool.output"] == '"tool-output:hello"'
+
+    def test_error_run_records_attributes_and_metric(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with pytest.raises(RuntimeError):
+            FailingTool().run(query="hello")
+        record = one_layer_record(loongsuite_harness, TOOL_SPAN)
+        assert record.au["au.tool.error.type"] == "RuntimeError"
+        # Capture is off, so no content from the failure reaches the span.
+        assert record.au["au.tool.error.message"] == "RuntimeError"
+        assert "au.tool.input" not in record.au
+        assert "au.tool.output" not in record.au
+        metrics = loongsuite_harness.metrics()
+        assert (
+            baseline.counter_value(
+                metrics,
+                "tool_errors_total",
+                au_tool_name="failing_tool",
+                au_tool_status="RuntimeError",
             )
             == 1
         )
 
-    def test_metrics_are_recorded_once(
-        self, tracer_provider, span_exporter, meter_provider, metric_reader
-    ):
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            StubTool().run(query="hello")
-        finally:
-            bridge.uninstrument()
-
-        collected = _collect_metrics(metric_reader)
-        for name in _METRIC_NAMES[TOOL_LAYER]:
-            if name == "tool_errors_total":
-                continue  # only an error produces this one
-            assert name in collected, f"{name} was never recorded"
-        assert (
-            _counter(
-                metric_reader, "tool_calls_total", au_tool_name="stub_tool"
-            )
-            == 1
-        )
-        assert (
-            _only_point(
-                metric_reader, "tool_call_duration", au_tool_name="stub_tool"
-            ).count
-            == 1
-        )
-
-    @pytest.mark.asyncio
-    async def test_async_run_produces_one_span(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            result = await StubTool().async_run(query="hello async")
-        finally:
-            bridge.uninstrument()
-
-        assert result == "tool-output:hello async"
-        span = _single_span(span_exporter)
-        _assert_au_tool_span(span, "stub_tool", content=False)
-        _assert_gen_ai_tool_span(span, "stub_tool")
-
-    def test_a_tool_call_inside_an_agent_nests_under_it(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            build_agent("tool_agent", ToolAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
-
-        assert sorted(span.name for span in _spans(span_exporter)) == [
-            "au.agent.tool_agent",
-            "au.tool.stub_tool",
-        ]
-        agent_span = _single_layer_span(span_exporter, AGENT_LAYER)
-        tool_span = _single_layer_span(span_exporter, TOOL_LAYER)
-        assert tool_span.parent.span_id == agent_span.context.span_id
-        assert _attributes(tool_span)["au.trace.caller_name"] == "tool_agent"
-        # Both layers keep both namespaces even when they are nested.
-        _assert_gen_ai_agent_span(agent_span, "tool_agent")
-        _assert_gen_ai_tool_span(tool_span, "stub_tool")
+    def test_conversation_memory_receives_input_and_output(
+        self, loongsuite_harness: Any, monkeypatch: Any
+    ) -> None:
+        calls = memory_spy(monkeypatch, tool_layer)
+        StubTool().run(query="hello")
+        assert "add_tool_input_info" in calls
+        assert "add_tool_output_info" in calls
 
 
 # ---------------------------------------------------------------------------
-# Token usage: the real field names, and the aggregation into the parent
+# Token usage
 # ---------------------------------------------------------------------------
 
 
 class TestTokenUsage:
-    def test_the_real_fields_are_text_in_and_text_out(self):
-        usage = TokenUsage(text_in=3, text_out=5)
-        assert usage.prompt_tokens == 3
-        assert usage.completion_tokens == 5
-        assert usage.total_tokens == 8
+    def test_llm_usage_attributes_and_metrics(
+        self, loongsuite_harness: Any
+    ) -> None:
+        StubLLM().call(prompt="hello")
+        record = one_layer_record(loongsuite_harness, LLM_SPAN)
+        assert record.au["au.llm.usage.total_tokens"] == 8
+        assert record.au["au.llm.usage.prompt_tokens"] == 3
+        assert record.au["au.llm.usage.completion_tokens"] == 5
+        metrics = loongsuite_harness.metrics()
+        assert baseline.histogram_values(
+            metrics, "llm_total_tokens", au_llm_name="stub_llm"
+        ) == [8]
+        assert baseline.histogram_values(
+            metrics, "llm_prompt_tokens", au_llm_name="stub_llm"
+        ) == [3]
+        assert baseline.histogram_values(
+            metrics, "llm_completion_tokens", au_llm_name="stub_llm"
+        ) == [5]
 
-    def test_the_derived_property_names_are_silently_ignored(self):
-        # ``TokenUsage`` is a pydantic-v1 model whose real fields are the
-        # text/image/audio/cached/reasoning counters; ``prompt_tokens`` and
-        # friends are read-only properties. Passing them sets nothing, which is
-        # what made an earlier probe report "the aggregation is always zero".
-        usage = TokenUsage(prompt=3, completion=5, total=8)
-        assert usage.prompt_tokens == 0
-        assert usage.completion_tokens == 0
-        assert usage.total_tokens == 0
-        assert usage.dict()["text_in"] == 0
+    def test_agent_aggregates_child_usage(
+        self, loongsuite_harness: Any
+    ) -> None:
+        run_agent(build_agent("rich_agent", RichAgent))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert record.au["au.agent.usage.total_tokens"] == 8
+        assert record.au["au.agent.usage.prompt_tokens"] == 3
+        assert record.au["au.agent.usage.completion_tokens"] == 5
+        metrics = loongsuite_harness.metrics()
+        assert baseline.histogram_values(
+            metrics, "agent_total_tokens", au_agent_name="rich_agent"
+        ) == [8]
+        assert baseline.histogram_values(
+            metrics, "agent_prompt_tokens", au_agent_name="rich_agent"
+        ) == [3]
+        assert baseline.histogram_values(
+            metrics, "agent_completion_tokens", au_agent_name="rich_agent"
+        ) == [5]
 
-    def test_a_real_llm_child_aggregates_onto_the_agent_span(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            build_agent("token_agent", LLMAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
+    def test_tool_usage_stays_at_zero(self, loongsuite_harness: Any) -> None:
+        StubTool().run(query="hello")
+        record = one_layer_record(loongsuite_harness, TOOL_SPAN)
+        assert record.au["au.tool.usage.total_tokens"] == 0
 
-        assert sorted(span.name for span in _spans(span_exporter)) == [
-            "au.agent.token_agent",
-            "au.llm.stub_llm",
-        ]
-        agent_attributes = _attributes(
-            _single_layer_span(span_exporter, AGENT_LAYER)
-        )
-        assert agent_attributes["au.agent.usage.prompt_tokens"] == 3
-        assert agent_attributes["au.agent.usage.completion_tokens"] == 5
-        assert agent_attributes["au.agent.usage.total_tokens"] == 8
-        assert agent_attributes["gen_ai.usage.input_tokens"] == 3
-        assert agent_attributes["gen_ai.usage.output_tokens"] == 5
-        assert agent_attributes["gen_ai.usage.total_tokens"] == 8
-        detail = json.loads(agent_attributes["au.agent.usage.detail_tokens"])
-        assert detail["prompt_tokens"] == 3
-        assert detail["completion_tokens"] == 5
-        assert detail["total_tokens"] == 8
+    def test_streamed_agent_usage_counts_once(
+        self, loongsuite_harness: Any
+    ) -> None:
+        run_agent(build_agent("stream_llm_agent", StreamingLLMAgent))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert record.au["au.agent.usage.total_tokens"] == 10
+        metrics = loongsuite_harness.metrics()
+        assert baseline.histogram_values(
+            metrics, "agent_total_tokens", au_agent_name="stream_llm_agent"
+        ) == [10]
 
-        llm_attributes = _attributes(
-            _single_layer_span(span_exporter, LLM_LAYER)
-        )
-        assert llm_attributes["au.llm.usage.total_tokens"] == 8
-        assert llm_attributes["gen_ai.usage.total_tokens"] == 8
+    def test_gen_ai_usage_attributes_are_set(
+        self, loongsuite_harness: Any
+    ) -> None:
+        StubLLM().call(prompt="hello")
+        record = one_layer_record(loongsuite_harness, LLM_SPAN)
+        assert record.gen_ai.get("gen_ai.usage.input_tokens") == 3
+        assert record.gen_ai.get("gen_ai.usage.output_tokens") == 5
 
-    def test_a_real_llm_child_aggregates_onto_the_agent_metrics(
-        self, tracer_provider, meter_provider, metric_reader
-    ):
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            build_agent("token_agent", LLMAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
-
-        labels = {"au_agent_name": "token_agent"}
-        assert _counter(metric_reader, "agent_calls_total", **labels) == 1
+    def test_each_layer_records_one_call(
+        self, loongsuite_harness: Any
+    ) -> None:
+        run_agent(build_agent("rich_agent", RichAgent))
+        metrics = loongsuite_harness.metrics()
         assert (
-            _histogram_sum(metric_reader, "agent_total_tokens", **labels) == 8
-        )
-        assert (
-            _histogram_sum(metric_reader, "agent_prompt_tokens", **labels) == 3
-        )
-        assert (
-            _histogram_sum(metric_reader, "agent_completion_tokens", **labels)
-            == 5
-        )
-        assert (
-            _counter(metric_reader, "llm_calls_total", au_llm_name="stub_llm")
+            baseline.counter_value(
+                metrics, "agent_calls_total", au_agent_name="rich_agent"
+            )
             == 1
         )
         assert (
-            _histogram_sum(
-                metric_reader, "llm_total_tokens", au_llm_name="stub_llm"
+            baseline.counter_value(
+                metrics, "llm_calls_total", au_llm_name="stub_llm"
             )
-            == 8
+            == 1
         )
-
-    def test_streaming_usage_is_double_counted_into_the_parent(
-        self, tracer_provider, span_exporter, meter_provider, metric_reader
-    ):
-        """Pin an agentUniverse 0.0.19.1 defect, so it stays visible.
-
-        ``llm_instrumentor.py`` adds the streamed usage to the LLM span's token
-        entry in ``process_sync_stream`` (and its async twin) and again in
-        ``_finalize_streaming_result``; ``LLMSpanManager.cleanup()`` then hands
-        the parent twice that usage. The LLM span keeps the real numbers -- only
-        the parent aggregate doubles. If agentUniverse ever fixes this, the
-        aggregate asserted here becomes 4/6/10 and this test says so.
-        """
-        bridge = _instrument_bridge(tracer_provider, meter_provider)
-        try:
-            build_agent("stream_agent", StreamingLLMAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
-
-        llm_attributes = _attributes(
-            _single_layer_span(span_exporter, LLM_LAYER)
-        )
-        assert llm_attributes["au.llm.usage.prompt_tokens"] == 4
-        assert llm_attributes["au.llm.usage.completion_tokens"] == 6
-        assert llm_attributes["au.llm.usage.total_tokens"] == 10
-
-        agent_attributes = _attributes(
-            _single_layer_span(span_exporter, AGENT_LAYER)
-        )
-        assert agent_attributes["au.agent.usage.prompt_tokens"] == 8
-        assert agent_attributes["au.agent.usage.completion_tokens"] == 12
-        assert agent_attributes["au.agent.usage.total_tokens"] == 20
-        # The mirrored gen_ai usage matches the native aggregate exactly.
-        assert agent_attributes["gen_ai.usage.total_tokens"] == 20
         assert (
-            _histogram_sum(
-                metric_reader,
-                "agent_total_tokens",
-                au_agent_name="stream_agent",
+            baseline.counter_value(
+                metrics, "tool_calls_total", au_tool_name="stub_tool"
             )
-            == 20
+            == 1
         )
 
 
 # ---------------------------------------------------------------------------
-# Privacy: content capture is off by default
+# Content privacy
 # ---------------------------------------------------------------------------
 
 
 class TestContentPrivacy:
-    def test_owned_bridge_with_capture_off_filters_all_three_layers(
-        self, tracer_provider, span_exporter, monkeypatch
-    ):
-        monkeypatch.delenv(_CONTENT_ENV, raising=False)
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
+    def test_capture_off_drops_content_on_every_layer(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_off():
+            run_agent(build_agent("rich_agent", RichAgent))
+        records = loongsuite_harness.records()
+        assert len(records) == 3
+        for record in records:
+            for key in (
+                "au.agent.input",
+                "au.agent.output",
+                "au.llm.input",
+                "au.llm.output",
+                "au.tool.input",
+                "au.tool.output",
+                "gen_ai.input.messages",
+                "gen_ai.output.messages",
+            ):
+                assert key not in record.au and key not in record.gen_ai, (
+                    f"{record.name} carried {key} with capture off"
+                )
 
-        _assert_one_span_per_layer(span_exporter)
-        for layer in _ALL_LAYERS:
-            span = _single_layer_span(span_exporter, layer)
-            _assert_no_content_on_the_layer(layer, span)
-            for key in _GEN_AI_CONTENT_KEYS:
-                assert key not in _attributes(span), key
-        # Everything that is not user content survives.
-        agent_attributes = _attributes(
-            _single_layer_span(span_exporter, AGENT_LAYER)
-        )
-        assert agent_attributes["au.agent.name"] == "rich_agent"
-        assert agent_attributes["au.agent.usage.total_tokens"] == 8
-        assert agent_attributes["gen_ai.usage.total_tokens"] == 8
-        tool_attributes = _attributes(
-            _single_layer_span(span_exporter, TOOL_LAYER)
-        )
-        assert tool_attributes["au.tool.name"] == "stub_tool"
-        assert tool_attributes["au.tool.pair_id"]
+    def test_capture_off_keeps_structure_and_usage(
+        self, loongsuite_harness: Any
+    ) -> None:
+        run_agent(build_agent("rich_agent", RichAgent))
+        agent = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert agent.au["au.agent.name"] == "rich_agent"
+        assert agent.au["au.agent.status"] == "success"
+        assert agent.au["au.span.kind"] == "agent"
+        assert agent.au["au.agent.usage.total_tokens"] == 8
+        assert agent.gen_ai["gen_ai.operation.name"] == "invoke_agent"
 
-    def test_owned_bridge_with_capture_on_writes_both_forms(
-        self, tracer_provider, span_exporter, monkeypatch
-    ):
-        monkeypatch.setenv(_CONTENT_ENV, "SPAN_ONLY")
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
+    def test_capture_on_writes_both_carriers(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_on():
+            run_agent(build_agent("rich_agent", RichAgent))
+        records = loongsuite_harness.records()
+        agent = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert "au.agent.input" in agent.au and "au.agent.output" in agent.au
+        assert "gen_ai.input.messages" in agent.gen_ai
+        assert "gen_ai.output.messages" in agent.gen_ai
+        messages = json.loads(agent.gen_ai["gen_ai.input.messages"])
+        assert messages[0]["role"] == "user"
+        assert "hello" in messages[0]["parts"][0]["content"]
+        assert json.loads(agent.gen_ai["gen_ai.output.messages"])
+        assert len(records) == 3
 
-        agent_attributes = _attributes(
-            _single_layer_span(span_exporter, AGENT_LAYER)
-        )
-        assert json.loads(agent_attributes["au.agent.input"]) == {
-            "kwargs": {"input": "hello"}
+    def test_capture_mode_is_read_per_call(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_off():
+            run_agent(build_agent("first_agent"))
+        with capture_on():
+            run_agent(build_agent("second_agent"))
+        off = one_layer_record(loongsuite_harness, "au.agent.first_agent")
+        on = one_layer_record(loongsuite_harness, "au.agent.second_agent")
+        assert "au.agent.input" not in off.au
+        assert "au.agent.input" in on.au
+
+    def test_unset_mode_is_no_content(self, loongsuite_harness: Any) -> None:
+        with content_capture(None):
+            run_agent(build_agent("default_agent"))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert "au.agent.input" not in record.au
+        assert "gen_ai.input.messages" not in record.gen_ai
+
+    def test_secrets_do_not_reach_any_span_attribute_with_capture_off(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_off():
+            run_agent(build_agent("secret_agent", SecretAgent))
+            with pytest.raises(RuntimeError):
+                run_agent(
+                    build_agent("secret_failure_agent", SecretFailingAgent)
+                )
+            with pytest.raises(RuntimeError):
+                SecretFailingLLM().call(prompt="hello")
+            with pytest.raises(RuntimeError):
+                SecretFailingTool().run(query="hello")
+        records = loongsuite_harness.records()
+        assert len(records) >= 4
+        for record in records:
+            for key, value in record.attributes.items():
+                assert SECRET not in str(key)
+                assert SECRET not in str(value), (
+                    f"{record.name} leaked a secret through {key}"
+                )
+            assert SECRET not in record.description, (
+                f"{record.name} leaked a secret through its status description"
+            )
+
+    def test_secrets_do_reach_content_attributes_with_capture_on(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_on():
+            run_agent(build_agent("secret_agent", SecretAgent))
+        records = loongsuite_harness.records()
+        values = [
+            str(value)
+            for record in records
+            for value in record.attributes.values()
+        ]
+        assert any(SECRET in value for value in values)
+
+    def test_llm_params_are_filtered_when_capture_is_off(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_off():
+            StubLLM().call(prompt="hello", api_key=SECRET)
+        record = one_layer_record(loongsuite_harness, LLM_SPAN)
+        assert SECRET not in record.au["au.llm.llm_params"]
+        assert set(json.loads(record.au["au.llm.llm_params"])) == {
+            "temperature"
         }
+
+    def test_error_message_is_not_a_traceback_when_capture_is_off(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_off():
+            with pytest.raises(RuntimeError):
+                run_agent(build_agent("boom_agent", FailingAgent))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert record.au["au.agent.error.message"] == "RuntimeError"
+        assert record.description == "RuntimeError"
+
+    def test_error_message_is_a_traceback_when_capture_is_on(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_on():
+            with pytest.raises(RuntimeError):
+                run_agent(build_agent("boom_agent", FailingAgent))
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
         assert (
-            json.loads(agent_attributes["gen_ai.input.messages"])
-            == _USER_MESSAGE
+            "Traceback (most recent call last)"
+            in record.au["au.agent.error.message"]
         )
-        llm_attributes = _attributes(
-            _single_layer_span(span_exporter, LLM_LAYER)
-        )
-        assert json.loads(llm_attributes["au.llm.input"])["prompt"] == "hello"
-        assert (
-            json.loads(llm_attributes["gen_ai.input.messages"])
-            == _USER_MESSAGE
-        )
-        assert llm_attributes["au.llm.output"] == "llm:hello"
-        tool_attributes = _attributes(
-            _single_layer_span(span_exporter, TOOL_LAYER)
-        )
-        assert json.loads(tool_attributes["au.tool.input"]) == {
-            "kwargs": {"query": "hello"}
-        }
-        assert (
-            tool_attributes["gen_ai.tool.call.arguments"]
-            == tool_attributes["au.tool.input"]
-        )
-        assert (
-            tool_attributes["gen_ai.tool.call.result"]
-            == tool_attributes["au.tool.output"]
-        )
-
-    def test_event_only_capture_writes_no_span_content(
-        self, tracer_provider, span_exporter, monkeypatch
-    ):
-        monkeypatch.setenv(_CONTENT_ENV, "EVENT_ONLY")
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
-
-        for layer in _ALL_LAYERS:
-            span = _single_layer_span(span_exporter, layer)
-            _assert_no_content_on_the_layer(layer, span)
-            for key in _GEN_AI_CONTENT_KEYS:
-                assert key not in _attributes(span), key
-
-    def test_pre_activated_native_keeps_its_content_contract(
-        self, tracer_provider, span_exporter, monkeypatch
-    ):
-        # An application that enabled the native instrumentors itself decides
-        # what they may export, so the bridge must not filter them.
-        monkeypatch.delenv(_CONTENT_ENV, raising=False)
-        natives = _instrument_all_natives(tracer_provider)
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            assert not any(layer.owned for layer in bridge._layers)
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
-            for native in natives:
-                native.uninstrument()
-
-        for layer in _ALL_LAYERS:
-            span = _single_layer_span(span_exporter, layer)
-            for key in _CONTENT_KEYS[layer]:
-                assert key in _attributes(span), key
-            # ... while the GenAI content still follows the capture switch.
-            for key in _GEN_AI_CONTENT_KEYS:
-                assert key not in _attributes(span), key
-
-    def test_extra_parameters_do_not_leak_into_the_messages(
-        self, tracer_provider, span_exporter, monkeypatch
-    ):
-        monkeypatch.setenv(_CONTENT_ENV, "SPAN_ONLY")
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            build_agent().run(input="hello", callbacks=["cb"])
-        finally:
-            bridge.uninstrument()
-
-        attributes = _attributes(_single_span(span_exporter))
-        assert json.loads(attributes["gen_ai.input.messages"]) == _USER_MESSAGE
-        assert "cb" not in attributes["gen_ai.input.messages"]
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle
+# Baseline: this package against the framework's own instrumentation
 # ---------------------------------------------------------------------------
 
 
-class TestLifecycle:
-    def test_double_instrument_still_yields_one_span_per_layer(
-        self, tracer_provider, span_exporter
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            # The second call is a no-op, not a second patch.
-            _instrument_bridge(tracer_provider)
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            bridge.uninstrument()
-            bridge.uninstrument()
+class TestBaselineMatrix:
+    def test_span_tree_and_au_attributes_match_native(
+        self, compare_runs: Any
+    ) -> None:
+        with capture_on():
+            result = compare_runs(
+                lambda: run_agent(build_agent("rich_agent", RichAgent))
+            )
+        assert sorted(baseline.names(result.native_records)) == sorted(
+            baseline.names(result.ours_records)
+        )
+        assert sorted(baseline.names(result.ours_records)) == [
+            "au.agent.rich_agent",
+            "au.llm.stub_llm",
+            "au.tool.stub_tool",
+        ]
+        for name in baseline.names(result.ours_records):
+            baseline.assert_same_span_shape(
+                baseline.find(result.native_records, name),
+                baseline.find(result.ours_records, name),
+            )
 
-        _assert_one_span_per_layer(span_exporter)
-
-    def test_uninstrument_restores_every_native_setter(self, tracer_provider):
-        originals = {
-            layer: {
-                name: getattr(_SETTER_CLASSES[layer], name)
-                for name in _BRIDGED_METHODS[layer]
+    def test_native_run_has_no_gen_ai_attributes_and_ours_adds_them(
+        self, compare_runs: Any
+    ) -> None:
+        result = compare_runs(
+            lambda: run_agent(build_agent("rich_agent", RichAgent))
+        )
+        assert result.native_records
+        for record in result.native_records:
+            assert record.gen_ai == {}
+        for record in result.ours_records:
+            assert record.gen_ai["gen_ai.framework"] == "agentuniverse"
+            assert record.gen_ai["gen_ai.span.kind"] in {
+                "AGENT",
+                "LLM",
+                "TOOL",
             }
-            for layer in _ALL_LAYERS
-        }
 
-        bridge = _instrument_bridge(tracer_provider)
-        for layer in _ALL_LAYERS:
-            for name, original in originals[layer].items():
-                assert getattr(_SETTER_CLASSES[layer], name) is not original
-
-        bridge.uninstrument()
-
-        for layer in _ALL_LAYERS:
-            for name, original in originals[layer].items():
-                assert getattr(_SETTER_CLASSES[layer], name) is original
-
-    def test_uninstrument_restores_the_wrapper_globals(self, tracer_provider):
-        saved = {
-            name: getattr(trace_module, name)
-            for name in NATIVE_WRAPPER_GLOBALS
-        }
-
-        bridge = _instrument_bridge(tracer_provider)
-        for native_cls in NATIVE_LAYER_GLOBALS:
-            assert active_native_instrumentor(native_cls) is not None
-
-        bridge.uninstrument()
-
-        for name, original in saved.items():
-            assert getattr(trace_module, name) is original, name
-        for native_cls in NATIVE_LAYER_GLOBALS:
-            assert active_native_instrumentor(native_cls) is None
-
-    def test_uninstrument_only_tears_down_the_layers_it_owns(
-        self, tracer_provider, span_exporter
-    ):
-        native_agent = _instrument_native(AGENT_LAYER, tracer_provider)
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            bridge.uninstrument()
-            assert (
-                active_native_instrumentor(AgentInstrumentor) is native_agent
-            )
-            assert active_native_instrumentor(LLMInstrumentor) is None
-            assert active_native_instrumentor(ToolInstrumentor) is None
-            build_agent().run(input="hello")
-        finally:
-            if native_agent.__dict__.get("_is_instrumented_by_opentelemetry"):
-                native_agent.uninstrument()
-
-        # The application's own agent instrumentor is still producing spans.
-        span = _single_span(span_exporter)
-        assert span.name == "au.agent.test_agent"
-        assert not _has_gen_ai_attributes(span)
-
-    def test_reinstrument_after_uninstrument_bridges_again(
-        self, tracer_provider, span_exporter
-    ):
-        first = _instrument_bridge(tracer_provider)
-        first.uninstrument()
-
-        second = _instrument_bridge(tracer_provider)
-        try:
-            build_agent("rich_agent", RichAgent).run(input="hello")
-        finally:
-            second.uninstrument()
-
-        _assert_one_span_per_layer(span_exporter)
-        for layer in _ALL_LAYERS:
-            assert _has_gen_ai_attributes(
-                _single_layer_span(span_exporter, layer)
+    def test_metrics_match_native(self, compare_runs: Any) -> None:
+        result = compare_runs(
+            lambda: run_agent(build_agent("rich_agent", RichAgent))
+        )
+        native = metric_contract(result.native_metrics)
+        ours = metric_contract(result.ours_metrics)
+        expected = recorded_on_success(
+            AGENT_METRICS + LLM_METRICS + TOOL_METRICS
+        )
+        for name in expected:
+            assert name in native, f"native did not record {name}"
+            assert name in ours, f"LoongSuite did not record {name}"
+            assert native[name] == ours[name], (
+                f"{name} labels differ: {native[name]} vs {ours[name]}"
             )
 
-    def test_uninstrument_stops_span_production(
-        self, tracer_provider, span_exporter, make_agent
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            make_agent().run(input="hello")
-            assert _spans(span_exporter)
-        finally:
-            bridge.uninstrument()
+    def test_token_values_match_native(self, compare_runs: Any) -> None:
+        result = compare_runs(
+            lambda: run_agent(build_agent("rich_agent", RichAgent))
+        )
+        for records in (result.native_records, result.ours_records):
+            agent = baseline.find(records, "au.agent.rich_agent")
+            assert agent.au["au.agent.usage.total_tokens"] == 8
+            assert agent.au["au.agent.usage.prompt_tokens"] == 3
+            assert agent.au["au.agent.usage.completion_tokens"] == 5
+        for metrics in (result.native_metrics, result.ours_metrics):
+            assert baseline.histogram_values(
+                metrics, "agent_total_tokens", au_agent_name="rich_agent"
+            ) == [8]
 
-        span_exporter.clear()
+    def test_error_path_matches_native(self, compare_runs: Any) -> None:
+        def workload() -> None:
+            with capture_on():
+                with pytest.raises(RuntimeError):
+                    run_agent(build_agent("boom_agent", FailingAgent))
 
-        make_agent().run(input="hello")
-        assert _spans(span_exporter) == []
+        result = compare_runs(workload)
+        native = baseline.find(result.native_records, "au.agent.boom_agent")
+        ours = baseline.find(result.ours_records, "au.agent.boom_agent")
+        baseline.assert_same_span_shape(
+            native, ours, ignore_au=("au.agent.error.message",)
+        )
+        assert (
+            native.au["au.agent.error.message"]
+            .strip()
+            .endswith("RuntimeError: agent exploded")
+        )
+        assert (
+            ours.au["au.agent.error.message"]
+            .strip()
+            .endswith("RuntimeError: agent exploded")
+        )
+        for metrics in (result.native_metrics, result.ours_metrics):
+            point = baseline.points_for(
+                metrics,
+                "agent_errors_total",
+                au_agent_name="boom_agent",
+                au_agent_status="RuntimeError",
+            )
+            assert len(point) == 1 and point[0].value == 1
+
+    def test_streaming_first_token_is_positive_in_both(
+        self, compare_runs: Any
+    ) -> None:
+        result = compare_runs(
+            lambda: list(StreamingLLM().call(prompt="hello"))
+        )
+        for records in (result.native_records, result.ours_records):
+            record = baseline.find(records, "au.llm.stream_llm")
+            assert record.au["au.llm.first_token.duration"] > 0
+            assert record.au["au.llm.streaming"] is True
+
+    def test_coexistence_leaves_one_span_per_layer(
+        self, both_harness: Any
+    ) -> None:
+        run_agent(build_agent("rich_agent", RichAgent))
+        records = both_harness.records()
+        assert len(records) == 3, baseline.names(records)
+        assert {record.name for record in records} == {
+            "au.agent.rich_agent",
+            "au.llm.stub_llm",
+            "au.tool.stub_tool",
+        }
+        for record in records:
+            assert record.gen_ai["gen_ai.framework"] == "agentuniverse"
+        metrics = both_harness.metrics()
+        assert (
+            baseline.counter_value(
+                metrics, "agent_calls_total", au_agent_name="rich_agent"
+            )
+            == 1
+        )
+        assert (
+            baseline.counter_value(
+                metrics, "llm_calls_total", au_llm_name="stub_llm"
+            )
+            == 1
+        )
+        assert (
+            baseline.counter_value(
+                metrics, "tool_calls_total", au_tool_name="stub_tool"
+            )
+            == 1
+        )
+
+    def test_intentional_difference_privacy_off(
+        self, compare_runs: Any
+    ) -> None:
+        def workload() -> None:
+            with capture_off():
+                run_agent(build_agent("privacy_agent"))
+
+        result = compare_runs(workload)
+        native = baseline.find(result.native_records, "au.agent.privacy_agent")
+        ours = baseline.find(result.ours_records, "au.agent.privacy_agent")
+        assert "au.agent.input" in native.au
+        assert "au.agent.input" not in ours.au
+
+    def test_intentional_difference_streaming_token_count(
+        self, compare_runs: Any
+    ) -> None:
+        result = compare_runs(
+            lambda: run_agent(build_agent("stream_agent", StreamingLLMAgent))
+        )
+        native = baseline.find(result.native_records, "au.agent.stream_agent")
+        ours = baseline.find(result.ours_records, "au.agent.stream_agent")
+        assert ours.au["au.agent.usage.total_tokens"] == 10
+        assert native.au["au.agent.usage.total_tokens"] == 20, (
+            "the framework's own instrumentation is expected to count a "
+            "streamed response onto its parent twice"
+        )
 
 
 # ---------------------------------------------------------------------------
-# Session scope: the bridge activates the agent/LLM/tool layers and nothing
-# else. ``au.trace.session.id`` belongs to agentUniverse's TelemetryManager.
+# Fail-safe behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestFailSafe:
+    def test_agent_info_failure_still_runs_the_call(
+        self, loongsuite_harness: Any, monkeypatch: Any
+    ) -> None:
+        def boom(*args: Any, **kwargs: Any) -> Any:
+            raise ValueError("no info for you")
+
+        monkeypatch.setattr(agent_layer, "_get_agent_info", boom)
+        result = run_agent(build_agent("failsafe_agent"))
+        assert result.get_data("output") == "echo:hello"
+        assert loongsuite_harness.spans() == []
+
+    def test_llm_info_failure_still_runs_the_call(
+        self, loongsuite_harness: Any, monkeypatch: Any
+    ) -> None:
+        from opentelemetry.instrumentation.agentuniverse import (
+            _llm as llm_layer,
+        )
+
+        monkeypatch.setattr(
+            llm_layer,
+            "_get_llm_info",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("boom")),
+        )
+        output = StubLLM().call(prompt="hello")
+        assert output.text == "llm:hello"
+        assert loongsuite_harness.spans() == []
+
+    def test_tool_info_failure_still_runs_the_call(
+        self, loongsuite_harness: Any, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(
+            tool_layer,
+            "_get_tool_info",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("boom")),
+        )
+        assert StubTool().run(query="hello") == "tool-output:hello"
+        assert loongsuite_harness.spans() == []
+
+    def test_invocation_chain_failure_still_runs_the_call(
+        self, loongsuite_harness: Any, monkeypatch: Any
+    ) -> None:
+        def boom(*args: Any, **kwargs: Any) -> Any:
+            raise ValueError("no chain")
+
+        monkeypatch.setattr(Monitor, "init_invocation_chain", boom)
+        result = run_agent(build_agent("chainless_agent"))
+        assert result.get_data("output") == "echo:hello"
+        assert (
+            one_layer_record(loongsuite_harness, AGENT_SPAN).au[
+                "au.agent.status"
+            ]
+            == "success"
+        )
+
+    def test_memory_failure_still_runs_the_call(
+        self, loongsuite_harness: Any, monkeypatch: Any
+    ) -> None:
+        class Broken:
+            def __init__(self) -> None:
+                raise RuntimeError("no memory")
+
+        monkeypatch.setattr(agent_layer, "ConversationMemoryModule", Broken)
+        result = run_agent(build_agent("memoryless_agent"))
+        assert result.get_data("output") == "echo:hello"
+
+    def test_async_cancellation_records_an_error(
+        self, loongsuite_harness: Any
+    ) -> None:
+        async def cancel() -> None:
+            agent = build_agent("cancel_agent", SlowAsyncAgent)
+            task = asyncio.ensure_future(agent.async_run(input="hello"))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(cancel())
+        record = one_layer_record(loongsuite_harness, AGENT_SPAN)
+        assert record.status == "ERROR"
+        assert record.au["au.agent.error.type"] == "CancelledError"
+        metrics = loongsuite_harness.metrics()
+        assert (
+            baseline.counter_value(
+                metrics,
+                "agent_errors_total",
+                au_agent_name="cancel_agent",
+                au_agent_status="CancelledError",
+            )
+            == 1
+        )
+
+    def test_streaming_agent_error_still_ends_once(
+        self, loongsuite_harness: Any
+    ) -> None:
+        agent = build_agent("stream_boom_agent", FailingStreamingAgent)
+        with pytest.raises(RuntimeError):
+            run_agent_with_stream(agent)
+        records = layer_records(loongsuite_harness, AGENT_SPAN)
+        assert len(records) == 1
+        assert records[0].status == "ERROR"
+        assert records[0].au["au.agent.streaming"] is True
+
+
+# ---------------------------------------------------------------------------
+# Session wiring
 # ---------------------------------------------------------------------------
 
 
 class TestSessionScope:
-    def test_bridge_touches_no_global_provider_or_propagator(
-        self, tracer_provider
-    ):
-        provider_before = trace.get_tracer_provider()
-        propagator_before = propagate.get_global_textmap()
+    def test_instrumentor_does_not_change_global_providers(self) -> None:
+        from opentelemetry import propagate, trace
 
-        bridge = _instrument_bridge(tracer_provider)
+        provider_before = trace.get_tracer_provider()
+        textmap_before = propagate.get_global_textmap()
+        instrumentor = AgentUniverseInstrumentor()
+        instrumentor.instrument(tracer_provider=None, meter_provider=None)
         try:
             assert trace.get_tracer_provider() is provider_before
-            assert propagate.get_global_textmap() is propagator_before
+            assert propagate.get_global_textmap() is textmap_before
         finally:
-            bridge.uninstrument()
-
+            instrumentor.uninstrument()
         assert trace.get_tracer_provider() is provider_before
-        assert propagate.get_global_textmap() is propagator_before
+        assert propagate.get_global_textmap() is textmap_before
 
-    def test_a_bridge_only_run_carries_no_session_attribute(
-        self, tracer_provider, span_exporter, make_agent
-    ):
-        bridge = _instrument_bridge(tracer_provider)
-        try:
-            make_agent().run(input="hello")
-        finally:
-            bridge.uninstrument()
+    def test_session_id_and_propagator_through_telemetry_manager(self) -> None:
+        probe = Path(__file__).resolve().parent / "session_probe_child.py"
+        completed = subprocess.run(
+            [sys.executable, str(probe)],
+            capture_output=True,
+            text=True,
+            cwd=str(PACKAGE_ROOT),
+        )
+        assert completed.returncode == 0, completed.stderr
+        payload = [
+            line
+            for line in completed.stdout.splitlines()
+            if line.startswith("PROBE_JSON=")
+        ]
+        assert payload, completed.stdout
+        report = json.loads(payload[0][len("PROBE_JSON=") :])
 
-        assert SESSION_ATTR not in _attributes(_single_span(span_exporter))
+        assert report["tracer_provider"] == "TracerProvider"
+        assert report["output"] == "llm:hello"
+        names = [span["name"] for span in report["spans"]]
+        assert "au.agent.session_agent" in names
+        assert "au.llm.session_llm" in names
+        for span in report["spans"]:
+            assert (
+                span["attributes"]["au.trace.session.id"] == report["session"]
+            )
+            assert span["attributes"]["gen_ai.framework"] == "agentuniverse"
+        assert report["carrier"]["AU-SessionId"] == report["session"]
+        assert report["carrier"]["auSessionId"] == report["session"]
+        assert report["session_after_extract"] == report["carrier_session"]
 
-    def test_telemetry_manager_session_path_in_an_isolated_process(self):
-        """The documented session path, run for real.
 
-        ``TelemetryManager.init_from_config`` installs the global provider, the
-        propagator and the ``SessionSpanProcessor``, and it can only run once
-        per process -- so it runs in a child process and reports what it saw.
+# ---------------------------------------------------------------------------
+# Package shape
+# ---------------------------------------------------------------------------
+
+
+class TestPackage:
+    def test_runtime_source_has_no_native_telemetry_references(self) -> None:
+        """No module may name, import or call a framework instrumentation.
+
+        Parsed rather than grepped: the module docstrings say what this
+        package deliberately does not use, and prose is not a dependency.
         """
-        payload = _run_session_child()
+        sources = sorted(SOURCE_ROOT.glob("*.py"))
+        assert sources
+        for path in sources:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            identifiers = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    identifiers.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    identifiers.add(node.attr)
+                elif isinstance(node, ast.alias):
+                    identifiers.add(node.name.split(".")[-1])
+                    if node.asname:
+                        identifiers.add(node.asname)
+            for token in FORBIDDEN_RUNTIME_REFERENCES:
+                assert token not in identifiers, f"{path.name} uses {token}"
 
-        assert payload["initialized"] is True
-        assert payload["propagator"] == "CompositePropagator"
-        assert payload["propagator_fields"] == ["AU-SessionId", "auSessionId"]
-        assert payload["span_names"] == [
-            "au.agent.session_agent",
-            "au.llm.stub_llm",
-            "au.tool.stub_tool",
-        ]
-        # One span per layer, and the session reaches every one of them.
-        assert payload["session_attributes"] == {
-            "au.agent.session_agent": _SESSION_ID,
-            "au.llm.stub_llm": _SESSION_ID,
-            "au.tool.stub_tool": _SESSION_ID,
+    def test_runtime_source_only_imports_allowed_framework_helpers(
+        self,
+    ) -> None:
+        """The framework imports left are business helpers, not telemetry."""
+        forbidden_modules = (
+            "agentuniverse.base.tracing.otel",
+            "agentuniverse.base.tracing.au_trace_context",
+        )
+        for path in sorted(SOURCE_ROOT.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    for forbidden in forbidden_modules:
+                        assert not node.module.startswith(forbidden), (
+                            f"{path.name} imports {node.module}"
+                        )
+
+    def test_entry_point_declares_the_instrumentor(self) -> None:
+        pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+        assert (
+            "opentelemetry.instrumentation.agentuniverse:AgentUniverseInstrumentor"
+            in pyproject
+        )
+
+    def test_distribution_entry_point_is_installed(self) -> None:
+        try:
+            distribution = metadata.distribution(
+                "loongsuite-instrumentation-agentuniverse"
+            )
+        except metadata.PackageNotFoundError:
+            pytest.skip("package not installed in this environment")
+        assert distribution.version
+        assert "agentuniverse" in {
+            entry.name for entry in distribution.entry_points
         }
-        # The LoongSuite bridge is active on that path too.
-        assert payload["gen_ai_span_kinds"] == {
-            "au.agent.session_agent": "AGENT",
-            "au.llm.stub_llm": "LLM",
-            "au.tool.stub_tool": "TOOL",
-        }
-        assert payload["agent_total_tokens"] == 8
-        # inject/extract round trip, on the propagator's real contract.
-        assert payload["carrier"] == {
-            "AU-SessionId": _SESSION_ID,
-            "auSessionId": _SESSION_ID,
-        }
-        assert payload["extracted_session_id"] == _CARRIER_SESSION
-        # ``AUSessionPropagator.extract`` stores the header value it picked as
-        # the baggage value for that header key -- a one-element list.
-        assert payload["extracted_baggage_in_returned_context"] == [
-            _CARRIER_SESSION
-        ]
+
+    def test_every_source_module_is_importable(self) -> None:
+        import opentelemetry.instrumentation.agentuniverse as package
+
+        for name in ("_common", "_agent", "_llm", "_tool"):
+            module = __import__(f"{package.__name__}.{name}", fromlist=[name])
+            assert module.__name__ == f"{package.__name__}.{name}"
+
+    def test_wrapper_globals_are_restored_by_the_autouse_fixture(self) -> None:
+        for name in WRAPPER_GLOBALS:
+            wrapper = getattr(trace_module, name)
+            assert getattr(wrapper, "__self__", None) is None, name
 
 
-def test_framework_is_the_real_distribution():
-    """Guard the whole suite: this must be the real agentUniverse."""
+def test_agents_used_by_the_matrix_are_real_framework_objects() -> None:
+    from agentuniverse.agent.action.tool.tool import Tool
+    from agentuniverse.agent.agent import Agent
 
-    from importlib.metadata import version
-
-    import agentuniverse
-
-    assert build_agent("probe").agent_model.info["name"] == "probe"
-    assert version("agentUniverse").startswith("0.0.19")
-    assert agentuniverse.__file__ is not None
+    assert issubclass(RichAgent, Agent)
+    assert issubclass(StubTool, Tool)
+    assert issubclass(SecretLLM, StubLLM)

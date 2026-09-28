@@ -250,15 +250,18 @@ class _ToolCall:
             return
         span = self.layer_span.span
         duration = self.layer_span.elapsed()
+        usage = token_usage_for(self.layer_span.span_id)
         run_safely(
             self._layer.metrics.record_error, error, duration, self.labels
         )
         run_safely(
             self._layer.metrics.record_tokens,
-            token_usage_for(self.layer_span.span_id),
+            usage,
             self.labels,
         )
         set_layer_error_attributes(span, ToolAttributes, error, duration)
+        # The framework records the (zero) usage of a failed tool call too.
+        set_usage_attributes(span, ToolAttributes, usage)
         set_error_status(span, error_status_text(error))
 
     def finalize(self, error: Optional[BaseException] = None) -> None:

@@ -291,7 +291,7 @@ layer that cannot even be constructed calls the original function directly.
 ## Tests
 
 The suite runs against a real `agentUniverse` 0.0.19.1 install (Python 3.12)
-with no stand-in: 74 tests pass, one is skipped.
+with no stand-in: 75 tests pass, one is skipped.
 
 * **Baseline matrix.** The same workload is run twice -- once with the
   framework's three instrumentors, once with this package -- and the two runs
@@ -317,9 +317,10 @@ with no stand-in: 74 tests pass, one is skipped.
 
 Mutation checks confirm the tests are load-bearing. Neuter one seam, run the
 suite, and the tests that must notice go red: the agent, LLM or tool wrapper
-(28, 26 and 13 failures), the transactional takeover (31), rollback/restore
+(28, 26 and 14 failures), the transactional takeover (31), rollback/restore
 (3), the privacy switch (9), stream finalization (7), token aggregation (6) and
-the session probe (1).
+the session probe (1). Restoring the file turns the suite green again, with no
+failures left behind.
 
 ```bash
 python -m pytest tests -v

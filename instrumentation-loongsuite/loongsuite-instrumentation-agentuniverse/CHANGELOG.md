@@ -59,13 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has been closed with an error status. A layer that cannot be constructed calls
   the original function directly.
 - Tests run against a real `agentUniverse` 0.0.19.1 install on Python 3.12 with
-  no stand-in: 74 pass, one is skipped. They include a baseline matrix that runs
+  no stand-in: 75 pass, one is skipped. They include a baseline matrix that runs
   the same workload under the framework's own three instrumentors and under this
   package and compares span tree, span names, kinds, status, `au.*` key set,
   all 26 metrics with their labels and values, non-zero token usage, positive
   first-token durations, error paths and conversation-memory side effects.
 - Mutation checks document that the tests are load-bearing. Neutering the agent,
-  LLM or tool wrapper (28 / 26 / 13 failing tests), the transactional takeover
+  LLM or tool wrapper (28 / 26 / 14 failing tests), the transactional takeover
   (31), rollback/restore (3), the privacy switch (9), stream finalization (7),
   token aggregation (6) or the session probe (1) each turns the corresponding
   tests red, and the suite is green again once restored.

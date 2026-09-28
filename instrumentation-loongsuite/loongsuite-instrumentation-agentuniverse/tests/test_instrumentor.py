@@ -1270,6 +1270,28 @@ class TestBaselineMatrix:
             )
             assert len(point) == 1 and point[0].value == 1
 
+    def test_tool_error_path_matches_native(self, compare_runs: Any) -> None:
+        def workload() -> None:
+            with capture_on():
+                with pytest.raises(RuntimeError):
+                    FailingTool().run(query="hello")
+
+        result = compare_runs(workload)
+        native = baseline.find(result.native_records, "au.tool.failing_tool")
+        ours = baseline.find(result.ours_records, "au.tool.failing_tool")
+        baseline.assert_same_span_shape(
+            native, ours, ignore_au=("au.tool.error.message",)
+        )
+        assert native.status == ours.status == "ERROR"
+        for metrics in (result.native_metrics, result.ours_metrics):
+            point = baseline.points_for(
+                metrics,
+                "tool_errors_total",
+                au_tool_name="failing_tool",
+                au_tool_status="RuntimeError",
+            )
+            assert len(point) == 1 and point[0].value == 1
+
     def test_streaming_first_token_is_positive_in_both(
         self, compare_runs: Any
     ) -> None:

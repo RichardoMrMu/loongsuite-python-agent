@@ -54,6 +54,10 @@ from agentuniverse.base.tracing.otel.instrumentation.agent.agent_instrumentor im
     AgentInstrumentor,
 )
 
+from opentelemetry.sdk.metrics import MeterProvider  # noqa: E402
+from opentelemetry.sdk.metrics.export import (  # noqa: E402
+    InMemoryMetricReader,
+)
 from opentelemetry.sdk.trace import TracerProvider  # noqa: E402
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor  # noqa: E402
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (  # noqa: E402
@@ -97,6 +101,21 @@ class FailingAgent(StubAgent):
         raise RuntimeError("agent exploded")
 
 
+class StreamingAgent(StubAgent):
+    """``StubAgent`` that pushes one token onto ``output_stream``.
+
+    The native wrapper swaps the caller's queue for one that records the first
+    put, so putting an item here is what exercises the first-token hook -- on
+    this path the native wrapper does not fall back to the end-of-call timing.
+    """
+
+    def execute(self, input_object: Any, agent_input: dict) -> dict:
+        stream = input_object.get_data("output_stream")
+        if stream is not None:
+            stream.put("first-token")
+        return {"output": "streamed"}
+
+
 def build_agent(
     name: str = "test_agent", agent_cls: type = StubAgent
 ) -> Agent:
@@ -119,6 +138,25 @@ def tracer_provider(
 ) -> Iterator[TracerProvider]:
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+    yield provider
+    provider.shutdown()
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[InMemoryMetricReader]:
+    yield InMemoryMetricReader()
+
+
+@pytest.fixture
+def meter_provider(
+    metric_reader: InMemoryMetricReader,
+) -> Iterator[MeterProvider]:
+    """A meter provider the native instrumentor can record its metrics into.
+
+    The native instrumentor reads the provider from ``instrument(...)``, so the
+    metrics tests hand it this one instead of the global no-op provider.
+    """
+    provider = MeterProvider(metric_readers=[metric_reader])
     yield provider
     provider.shutdown()
 

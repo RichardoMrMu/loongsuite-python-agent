@@ -25,9 +25,23 @@ is active -- and patches the native ``AgentSpanAttributesSetter`` statics so the
 LoongSuite GenAI conventions (``gen_ai.*``) land on the *same* span, right after
 the native ``au.*`` attributes.
 
+Content capture
+---------------
 ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is read once, at
-``instrument()`` time, through the shared GenAI util: only ``SPAN_ONLY`` and
-``SPAN_AND_EVENT`` write ``gen_ai.input.messages``. Every write is fail-safe.
+``instrument()`` time, through the shared GenAI util. Only ``SPAN_ONLY`` and
+``SPAN_AND_EVENT`` write ``gen_ai.input.messages``.
+
+The native setter also writes the raw prompt to ``au.agent.input`` and the agent
+result to ``au.agent.output`` unconditionally, so ``gen_ai.input.messages`` on
+its own cannot express "do not capture content". When this bridge is the one
+that activated the native instrumentor (``_native_owned``) and capture is off, it
+hands the content-bearing setters a redacting span view that drops those two
+attributes while every other ``au.*`` attribute is still recorded. A native
+instrumentor the application activated itself is never filtered: its
+``au.agent.input`` / ``au.agent.output`` behaviour stays governed by the
+application's own configuration.
+
+Every attribute write is fail-safe.
 """
 
 from __future__ import annotations
@@ -77,6 +91,34 @@ _BRIDGED_METHODS = (
     "set_error_attributes",
 )
 _BRIDGE_MARKER = "_loongsuite_genai_bridge"
+
+# The native attributes that carry user content, and the setters that write
+# them. Only these are suppressible; every other ``au.*`` attribute is kept.
+_PRIVATE_ATTRS = frozenset({"au.agent.input", "au.agent.output"})
+_CONTENT_SETTERS = frozenset({_INPUT_SETTER, "set_success_attributes"})
+
+
+class _RedactingSpan:
+    """A span view that drops the content-bearing attributes.
+
+    The native setters write through ``span.set_attribute``, so passing them this
+    proxy while content capture is off keeps the raw prompt (``au.agent.input``)
+    and the agent result (``au.agent.output``) off the span, while every other
+    ``au.*`` attribute is still recorded.
+    """
+
+    __slots__ = ("_span",)
+
+    def __init__(self, span: Any) -> None:
+        self._span = span
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        if key not in _PRIVATE_ATTRS:
+            self._span.set_attribute(key, value)
+
+    def __getattr__(self, name: str) -> Any:
+        # Anything else the setter reaches for -- set_status, is_recording, ...
+        return getattr(self._span, name)
 
 
 def _safe_set(span: Any, key: str, value: Any) -> None:
@@ -154,14 +196,19 @@ def _set_input_messages(span: Any, input_params: Any) -> None:
 
 
 def _make_bridged_setter(
-    method_name: str, original: Any, capture: bool
+    method_name: str, original: Any, capture: bool, redact: bool
 ) -> Any:
     """Wrap a native setter so it also writes ``gen_ai.*`` on the same span."""
     # Only the input setter receives the agent name and the input payload.
     captures_input = capture and method_name == _INPUT_SETTER
+    # Only the content-bearing setters can leak the prompt or the result.
+    redacts_content = redact and method_name in _CONTENT_SETTERS
 
     def bridged(span, *args):
-        original(span, *args)
+        # The native setter writes through ``target``; the LoongSuite attributes
+        # below always go to the real span so they can never be filtered out.
+        target = _RedactingSpan(span) if redacts_content else span
+        original(target, *args)
         _set_common_attributes(span, args[0] if captures_input else None)
         if captures_input and len(args) > 1:
             _set_input_messages(span, args[1])
@@ -171,7 +218,9 @@ def _make_bridged_setter(
     return bridged
 
 
-def _install_bridge(setter_cls: type, capture: bool) -> dict[str, Any]:
+def _install_bridge(
+    setter_cls: type, capture: bool, redact: bool
+) -> dict[str, Any]:
     """Replace the native setter statics; return the originals to restore.
 
     Returns an empty mapping when the setters are already bridged, so a later
@@ -189,7 +238,9 @@ def _install_bridge(setter_cls: type, capture: bool) -> dict[str, Any]:
         setattr(
             setter_cls,
             name,
-            staticmethod(_make_bridged_setter(name, original, capture)),
+            staticmethod(
+                _make_bridged_setter(name, original, capture, redact)
+            ),
         )
     return originals
 
@@ -224,6 +275,7 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
             self._setter_cls = None
             self._originals: dict[str, Any] = {}
             self._content_mode = ContentCapturingMode.NO_CONTENT
+            self._privacy_filter = False
 
     def instrumentation_dependencies(self) -> Collection[str]:
         return _instruments
@@ -250,6 +302,7 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
                 "could not resolve the GenAI capture mode", exc_info=True
             )
             self._content_mode = ContentCapturingMode.NO_CONTENT
+        capture = self._content_mode in _CONTENT_ON_SPAN_MODES
         self._setter_cls = AgentSpanAttributesSetter
 
         # Span creation is delegated: reuse the native instrumentor when the
@@ -264,9 +317,12 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
                 skip_dep_check=True,
             )
 
+        # Only a native instrumentor this bridge activated may be filtered: one
+        # the application activated itself keeps its own au.agent.input/output
+        # contract, whatever the application configured it to do.
+        self._privacy_filter = self._native_owned and not capture
         self._originals = _install_bridge(
-            AgentSpanAttributesSetter,
-            self._content_mode in _CONTENT_ON_SPAN_MODES,
+            AgentSpanAttributesSetter, capture, self._privacy_filter
         )
 
     def _uninstrument(self, **kwargs: Any) -> None:
@@ -288,3 +344,4 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
         self._native = None
         self._native_owned = False
         self._content_mode = ContentCapturingMode.NO_CONTENT
+        self._privacy_filter = False

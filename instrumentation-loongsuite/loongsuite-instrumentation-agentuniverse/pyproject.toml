@@ -8,7 +8,10 @@ dynamic = ["version"]
 description = "LoongSuite agentUniverse Instrumentation"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+# agentUniverse's own dependency pins (numpy<2, grpcio==1.63.0, pyarrow<17) have
+# no cp313 wheels, so the ``instruments`` extra cannot be installed on 3.13.
+# Keep this in step with the tox matrix in tox-loongsuite.ini.
+requires-python = ">=3.10,<3.13"
 authors = [
   { name = "OpenTelemetry Authors", email = "cncf-opentelemetry-contributors@lists.cncf.io" },
 ]
@@ -21,14 +24,12 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
   "opentelemetry-api >= 1.37.0",
   "opentelemetry-instrumentation >= 0.58b0",
   "opentelemetry-semantic-conventions >= 0.58b0",
   "opentelemetry-util-genai",
-  "wrapt >= 1.17.3, < 2.0.0",
 ]
 
 [project.optional-dependencies]

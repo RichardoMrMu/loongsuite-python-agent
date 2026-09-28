@@ -13,3 +13,4 @@
 # limitations under the License.
 
 _instruments = ("agentUniverse >= 0.0.19",)
+_supports_metrics = True

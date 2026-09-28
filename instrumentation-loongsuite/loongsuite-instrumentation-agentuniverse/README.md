@@ -109,10 +109,15 @@ metrics and ends the span.
 On top of that the handler writes `gen_ai.usage.input_tokens/output_tokens/
 total_tokens` from the same numbers the `au.*.usage.*` attributes carry,
 `gen_ai.response.time_to_first_token` for agent and LLM calls, the LLM's
-`gen_ai.response.finish_reasons`, the tool call arguments and result, and, with
-content capture on, the conventional
-`gen_ai.input.messages` / `gen_ai.output.messages` /
-`gen_ai.system_instructions`.
+`gen_ai.response.finish_reasons`, the tool call carriers
+`gen_ai.tool.call.arguments` / `gen_ai.tool.call.result` and, with content
+capture on, the conventional `gen_ai.input.messages` /
+`gen_ai.output.messages` / `gen_ai.system_instructions`.
+
+The handler additionally records its own client metrics on those spans,
+`gen_ai.client.operation.duration` and `gen_ai.client.token.usage`, next to the
+26 `au.*` metrics. The framework's own instrumentation has no equivalent of
+those two.
 
 ## Coexistence with agentUniverse's own instrumentation
 
@@ -291,13 +296,15 @@ layer that cannot even be constructed calls the original function directly.
 ## Tests
 
 The suite runs against a real `agentUniverse` 0.0.19.1 install (Python 3.12)
-with no stand-in: 75 tests pass, one is skipped.
+with no stand-in: 77 tests pass, one is skipped.
 
 * **Baseline matrix.** The same workload is run twice -- once with the
   framework's three instrumentors, once with this package -- and the two runs
   are compared: span tree and parent relationships, span names, kinds and
   status, the `au.*` key set and value semantics, all 26 metrics with their
-  labels and values, non-zero token usage (`TokenUsage(text_in=3, text_out=5)`
+  labels and values -- the family sets are compared exactly, nine agent, nine
+  LLM and eight tool families, no family missing and none extra -- non-zero
+  token usage (`TokenUsage(text_in=3, text_out=5)`
   reaching the agent span as 8 / 3 / 5), positive first-token durations, error
   spans, and `ConversationMemoryModule` side effects. Dynamic values (durations,
   pair ids, UUIDs) are compared by type and sign, not by value.
@@ -317,7 +324,7 @@ with no stand-in: 75 tests pass, one is skipped.
 
 Mutation checks confirm the tests are load-bearing. Neuter one seam, run the
 suite, and the tests that must notice go red: the agent, LLM or tool wrapper
-(28, 26 and 14 failures), the transactional takeover (31), rollback/restore
+(29, 27 and 16 failures), the transactional takeover (32), rollback/restore
 (3), the privacy switch (9), stream finalization (7), token aggregation (6) and
 the session probe (1). Restoring the file turns the suite green again, with no
 failures left behind.

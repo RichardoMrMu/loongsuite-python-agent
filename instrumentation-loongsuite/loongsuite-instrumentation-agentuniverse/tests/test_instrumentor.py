@@ -1042,6 +1042,8 @@ class TestContentPrivacy:
                 "au.tool.output",
                 "gen_ai.input.messages",
                 "gen_ai.output.messages",
+                "gen_ai.tool.call.arguments",
+                "gen_ai.tool.call.result",
             ):
                 assert key not in record.au and key not in record.gen_ai, (
                     f"{record.name} carried {key} with capture off"
@@ -1073,6 +1075,19 @@ class TestContentPrivacy:
         assert "hello" in messages[0]["parts"][0]["content"]
         assert json.loads(agent.gen_ai["gen_ai.output.messages"])
         assert len(records) == 3
+
+    def test_capture_on_writes_the_tool_call_content(
+        self, loongsuite_harness: Any
+    ) -> None:
+        with capture_on():
+            StubTool().run(query="hello")
+        record = one_layer_record(loongsuite_harness, TOOL_SPAN)
+        assert record.au["au.tool.input"]
+        assert record.au["au.tool.output"] == '"tool-output:hello"'
+        assert json.loads(record.gen_ai["gen_ai.tool.call.arguments"]) == {
+            "kwargs": {"query": "hello"}
+        }
+        assert record.gen_ai["gen_ai.tool.call.result"] == "tool-output:hello"
 
     def test_capture_mode_is_read_per_call(
         self, loongsuite_harness: Any
@@ -1223,6 +1238,47 @@ class TestBaselineMatrix:
             assert name in ours, f"LoongSuite did not record {name}"
             assert native[name] == ours[name], (
                 f"{name} labels differ: {native[name]} vs {ours[name]}"
+            )
+
+    def test_metric_family_sets_are_exactly_nine_nine_eight(
+        self, compare_runs: Any
+    ) -> None:
+        result = compare_runs(
+            lambda: run_agent(build_agent("rich_agent", RichAgent))
+        )
+        layers = (AGENT_METRICS, LLM_METRICS, TOOL_METRICS)
+        assert [len(names) for names in layers] == [9, 9, 8]
+        declared = set(AGENT_METRICS) | set(LLM_METRICS) | set(TOOL_METRICS)
+        assert len(declared) == 26, (
+            "the three prefixes keep the families distinct"
+        )
+        for name in (
+            "agent_errors_total",
+            "llm_errors_total",
+            "tool_errors_total",
+        ):
+            assert name in declared
+
+        # A counter with no recorded value exports no family, so a successful
+        # call shows every family but the three error counters.
+        au_families = set(recorded_on_success(sorted(declared)))
+        assert len(au_families) == 23
+        # The shared GenAI handler records the client-side conventions on the
+        # spans this package creates; the framework's own instrumentation has
+        # no equivalent.
+        gen_ai_client = {
+            "gen_ai.client.operation.duration",
+            "gen_ai.client.token.usage",
+        }
+        for label, metrics, extra in (
+            ("native", result.native_metrics, set()),
+            ("LoongSuite", result.ours_metrics, gen_ai_client),
+        ):
+            exported = set(baseline.metric_names(metrics))
+            expected = au_families | extra
+            assert exported == expected, (
+                f"{label} families differ: extra {sorted(exported - expected)}, "
+                f"missing {sorted(expected - exported)}"
             )
 
     def test_token_values_match_native(self, compare_runs: Any) -> None:

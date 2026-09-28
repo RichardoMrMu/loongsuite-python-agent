@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "loongsuite-instrumentation-agentuniverse"
 dynamic = ["version"]
 description = "LoongSuite agentUniverse Instrumentation"
+supports_metrics = true
 readme = "README.md"
 license = "Apache-2.0"
 # agentUniverse's own dependency pins (numpy<2, grpcio==1.63.0, pyarrow<17) have

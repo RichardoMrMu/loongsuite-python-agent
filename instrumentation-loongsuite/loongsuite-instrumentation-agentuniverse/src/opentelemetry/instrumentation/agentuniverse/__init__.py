@@ -12,363 +12,279 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-OpenTelemetry agentUniverse Instrumentation
+"""OpenTelemetry agentUniverse instrumentation: a bridge onto the framework's own.
 
-Produces an ARMS gen-ai **AGENT** span around each execution of an
-`agentUniverse <https://github.com/alipay/agentUniverse>`_ agent. The span
-brackets ``agentuniverse.agent.agent.Agent.run`` (and its async twin
-``Agent.async_run``), so every piece of work the agent performs -- planning,
-tool calls, knowledge retrieval, memory access, LLM requests and any
-downstream instrumentation -- nests underneath a single ``invoke_agent`` span
-sharing one trace id.
+agentUniverse ships an OpenTelemetry ``AgentInstrumentor`` (0.0.18+) that already
+creates one ``au.agent.{source}`` INTERNAL span per ``Agent.run`` /
+``Agent.async_run`` call, owning the ``au.*`` attributes, metrics, streaming
+first-token timing, memory recording and error handling. This package therefore
+creates no span and wraps neither method: that would add a duplicate span around
+every agent call whenever the native instrumentor is enabled too, which is the
+normal setup. It reuses an active native instrumentor -- or creates one when none
+is active -- and patches the native ``AgentSpanAttributesSetter`` statics so the
+LoongSuite GenAI conventions (``gen_ai.*``) land on the *same* span, right after
+the native ``au.*`` attributes.
 
-Instrumentation seam
---------------------
-Unlike frameworks whose execution entry point is an abstract method each agent
-implements, agentUniverse defines ``run`` / ``async_run`` **concretely on the
-base ``Agent`` class**: subclasses supply the pieces (``input_keys``,
-``output_keys``, ``parse_input``, ``parse_result``) and the base class owns the
-execution skeleton. Wrapping the two base-class methods therefore covers every
-agent, including agents defined after ``instrument()``, with no
-``__init_subclass__`` hook and no subclass walk.
-
-Both methods are wrapped with ``wrapt`` and marked with a sentinel so
-double-wrapping is impossible; ``uninstrument`` restores the originals.
-
-Span
-----
-``kind=INTERNAL`` (agent execution is in-process work, not an inbound server
-request), named ``invoke_agent {agent_name}``, where ``agent_name`` comes from
-``instance.agent_model.info['name']`` and falls back to the concrete class name
-when the agent has not been initialized from YAML yet.
-
-Content capture
----------------
-User input is recorded on ``gen_ai.input.messages`` only when the shared GenAI
-util's content-capture switch enables span content -- i.e. when
-``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is ``SPAN_ONLY`` or
-``SPAN_AND_EVENT``. An absent or invalid value defaults to ``NO_CONTENT`` (no
-message content), consistent with every other loongsuite instrumentation.
-
-Fail-safe
----------
-Every telemetry operation is guarded: an error raised while starting a span,
-recording attributes or recording an exception is swallowed so instrumentation
-can never interrupt or alter agent execution.
+``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is read once, at
+``instrument()`` time, through the shared GenAI util: only ``SPAN_ONLY`` and
+``SPAN_AND_EVENT`` write ``gen_ai.input.messages``. Every write is fail-safe.
 """
 
-import json
+from __future__ import annotations
+
 import logging
+from collections.abc import Mapping
+from dataclasses import asdict
 from typing import Any, Collection, Optional
 
-from wrapt import wrap_function_wrapper
-
-from opentelemetry import trace as trace_api
 from opentelemetry.instrumentation.agentuniverse.package import _instruments
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
-from opentelemetry.instrumentation.utils import unwrap
-from opentelemetry.trace import SpanKind, Status, StatusCode
 from opentelemetry.util.genai.extended_semconv.gen_ai_extended_attributes import (
     GEN_AI_SPAN_KIND,
     GenAiSpanKindValues,
 )
-from opentelemetry.util.genai.types import ContentCapturingMode
-from opentelemetry.util.genai.utils import get_content_capturing_mode
+from opentelemetry.util.genai.types import (
+    ContentCapturingMode,
+    InputMessage,
+    Text,
+)
+from opentelemetry.util.genai.utils import (
+    gen_ai_json_dumps,
+    get_content_capturing_mode,
+)
 
 logger = logging.getLogger(__name__)
 
-# -- Framework identifier -----------------------------------------------------
-_FRAMEWORK = "agentuniverse"
-
-# -- GenAI semantic-convention attribute keys (sourced from the shared util) --
-_GEN_AI_SPAN_KIND = GEN_AI_SPAN_KIND
-_GEN_AI_OPERATION_NAME = "gen_ai.operation.name"
-_GEN_AI_FRAMEWORK = "gen_ai.framework"
+# GenAI conventions this bridge adds to the native agent span.
+_GEN_AI_IDENTITY = {
+    "gen_ai.operation.name": "invoke_agent",
+    "gen_ai.framework": "agentuniverse",
+}
 _GEN_AI_AGENT_NAME = "gen_ai.agent.name"
 _GEN_AI_INPUT_MESSAGES = "gen_ai.input.messages"
-
-_SPAN_KIND_AGENT = GenAiSpanKindValues.AGENT.value
-_OP_INVOKE_AGENT = "invoke_agent"
-
-# -- Sentinel and wrapped methods ---------------------------------------------
-_AGENTUNIVERSE_MARKER = "_otel_agentuniverse_wrapped"
-_TARGET_METHODS = ("run", "async_run")
-
-# Content-capture modes under which message text may be written onto spans.
 _CONTENT_ON_SPAN_MODES = frozenset(
     {ContentCapturingMode.SPAN_ONLY, ContentCapturingMode.SPAN_AND_EVENT}
 )
+_NON_INPUT_KEYS = frozenset({"callbacks"})  # runtime plumbing, not user input
 
-# Keys that carry runtime plumbing rather than user input; they are left out of
-# the captured input when the conventional ``input`` key is absent.
-_NON_INPUT_KEYS = frozenset({"callbacks"})
+# Native instrumentation surface this bridge addresses.
+_NATIVE_AGENT_NAME_ATTR = "au.agent.name"
+_TRACE_WRAPPER_GLOBALS = ("_agent_wrapper_sync", "_agent_wrapper_async")
+_INPUT_SETTER = "set_input_attributes"
+_BRIDGED_METHODS = (
+    _INPUT_SETTER,
+    "set_success_attributes",
+    "set_error_attributes",
+)
+_BRIDGE_MARKER = "_loongsuite_genai_bridge"
 
 
-def _capture_content() -> bool:
-    """True when message content should be written onto spans.
-
-    Delegated to the shared util so an absent/invalid
-    ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` defaults to
-    ``NO_CONTENT`` (no capture), matching the rest of loongsuite.
-    """
+def _safe_set(span: Any, key: str, value: Any) -> None:
     try:
-        return get_content_capturing_mode() in _CONTENT_ON_SPAN_MODES
-    except Exception:  # pragma: no cover - defensive: never break the app
-        return False
+        span.set_attribute(key, value)
+    except Exception:  # defensive: instrumentation must never break the app
+        logger.debug("could not set %s on the agent span", key, exc_info=True)
 
 
-def _text_message_json(role: str, content: Any) -> str:
-    message = {
-        "role": role,
-        "parts": [{"type": "text", "content": str(content)}],
-    }
+def _find_active_native(trace_module: Any, native_cls: type) -> Optional[Any]:
+    """The native AgentInstrumentor already installed, if any."""
+    for name in _TRACE_WRAPPER_GLOBALS:
+        owner = getattr(getattr(trace_module, name, None), "__self__", None)
+        if isinstance(owner, native_cls):
+            return owner
+    return None
+
+
+def _native_agent_name(span: Any) -> Optional[str]:
+    """The agent name the native input setter already recorded on the span."""
     try:
-        return json.dumps([message], ensure_ascii=False, separators=(",", ":"))
-    except Exception:  # pragma: no cover - defensive
-        return str([message])
-
-
-def _extract_input(kwargs: Any) -> Optional[str]:
-    """Best-effort extraction of the user input from the run() kwargs.
-
-    ``agent.run(input=...)`` is the conventional call shape, so the ``input``
-    key wins when present. Otherwise the remaining kwargs are serialized as
-    JSON; agent execution is driven by these kwargs, which is the closest thing
-    to a user message at this boundary.
-    """
-    if not kwargs:
-        return None
-    try:
-        value = kwargs.get("input")
-        if value is not None:
-            return str(value)
-        remaining = {
-            key: val
-            for key, val in kwargs.items()
-            if key not in _NON_INPUT_KEYS
-        }
-        if not remaining:
-            return None
-        return json.dumps(
-            remaining,
-            ensure_ascii=False,
-            default=str,
-            separators=(",", ":"),
+        name = (getattr(span, "attributes", None) or {}).get(
+            _NATIVE_AGENT_NAME_ATTR
         )
-    except Exception:  # pragma: no cover - defensive
+    except Exception:  # defensive: instrumentation must never break the app
+        return None
+    return str(name) if name else None
+
+
+def _set_common_attributes(span: Any, source_name: Any = None) -> None:
+    """Write the LoongSuite GenAI identity attributes for an agent span."""
+    _safe_set(span, GEN_AI_SPAN_KIND, GenAiSpanKindValues.AGENT.value)
+    for key, value in _GEN_AI_IDENTITY.items():
+        _safe_set(span, key, value)
+    name = source_name or _native_agent_name(span)
+    if name:
+        _safe_set(span, _GEN_AI_AGENT_NAME, str(name))
+
+
+def _extract_user_input(input_params: Any) -> Optional[str]:
+    """Recover the user input from the native input params.
+
+    The native ``_get_input`` binds ``run(self, **kwargs)``, so the payload is
+    normally nested under ``kwargs``. ``input`` wins when present; otherwise
+    the remaining parameters are serialized, minus runtime plumbing.
+    """
+    if not isinstance(input_params, Mapping):
+        return None
+    params = input_params.get("kwargs")
+    if not isinstance(params, Mapping):
+        params = input_params
+    if params.get("input") is not None:
+        return str(params["input"])
+    remaining = {k: v for k, v in params.items() if k not in _NON_INPUT_KEYS}
+    try:
+        return gen_ai_json_dumps(remaining) if remaining else None
+    except Exception:  # defensive: instrumentation must never break the app
+        logger.debug("could not serialize the agent input", exc_info=True)
         return None
 
 
-def _agent_name(instance: Any) -> str:
-    """Resolve the agent display name, falling back to the class name."""
-    if instance is None:
-        return _FRAMEWORK
+def _set_input_messages(span: Any, input_params: Any) -> None:
+    """Record the user input as ``gen_ai.input.messages`` (capture opted in)."""
     try:
-        info = getattr(getattr(instance, "agent_model", None), "info", None)
-        if isinstance(info, dict):
-            name = info.get("name")
-            if name:
-                return str(name)
-    except Exception:  # pragma: no cover - defensive: never break the app
-        pass
-    return type(instance).__name__
+        text = _extract_user_input(input_params)
+        if text:
+            message = InputMessage(role="user", parts=[Text(content=text)])
+            _safe_set(
+                span,
+                _GEN_AI_INPUT_MESSAGES,
+                gen_ai_json_dumps([asdict(message)]),
+            )
+    except Exception:  # defensive: instrumentation must never break the app
+        logger.debug("could not capture the agent input", exc_info=True)
 
 
-def _safe_set_attributes(span: Any, agent_name: str, kwargs: Any) -> None:
-    """Populate span attributes; telemetry failures must never break execution."""
-    try:
-        span.set_attribute(_GEN_AI_SPAN_KIND, _SPAN_KIND_AGENT)
-        span.set_attribute(_GEN_AI_OPERATION_NAME, _OP_INVOKE_AGENT)
-        span.set_attribute(_GEN_AI_FRAMEWORK, _FRAMEWORK)
-        span.set_attribute(_GEN_AI_AGENT_NAME, agent_name)
+def _make_bridged_setter(
+    method_name: str, original: Any, capture: bool
+) -> Any:
+    """Wrap a native setter so it also writes ``gen_ai.*`` on the same span."""
+    # Only the input setter receives the agent name and the input payload.
+    captures_input = capture and method_name == _INPUT_SETTER
 
-        if _capture_content():
-            text = _extract_input(kwargs)
-            if text:
-                span.set_attribute(
-                    _GEN_AI_INPUT_MESSAGES,
-                    _text_message_json("user", text),
-                )
-    except Exception:  # pragma: no cover - defensive: never break the app
-        logger.debug(
-            "agentUniverse instrumentation failed to set span attributes",
-            exc_info=True,
+    def bridged(span, *args):
+        original(span, *args)
+        _set_common_attributes(span, args[0] if captures_input else None)
+        if captures_input and len(args) > 1:
+            _set_input_messages(span, args[1])
+
+    bridged.__name__ = method_name
+    setattr(bridged, _BRIDGE_MARKER, True)
+    return bridged
+
+
+def _install_bridge(setter_cls: type, capture: bool) -> dict[str, Any]:
+    """Replace the native setter statics; return the originals to restore.
+
+    Returns an empty mapping when the setters are already bridged, so a later
+    ``uninstrument()`` never tears down a bridge this call did not install.
+    """
+    originals: dict[str, Any] = {}
+    for name in _BRIDGED_METHODS:
+        descriptor = setter_cls.__dict__.get(name)
+        if descriptor is None:
+            continue
+        original = getattr(setter_cls, name)
+        if getattr(original, _BRIDGE_MARKER, False):
+            return {}
+        originals[name] = descriptor
+        setattr(
+            setter_cls,
+            name,
+            staticmethod(_make_bridged_setter(name, original, capture)),
         )
+    return originals
 
 
-def _safe_record_exception(span: Any, exc: BaseException) -> None:
-    try:
-        span.record_exception(exc)
-        span.set_status(Status(StatusCode.ERROR))
-    except Exception:  # pragma: no cover - defensive
-        pass
-
-
-def _safe_set_ok(span: Any) -> None:
-    try:
-        span.set_status(Status(StatusCode.OK))
-    except Exception:  # pragma: no cover - defensive
-        pass
-
-
-class _RunWrapper:
-    """Wrap ``Agent.run`` to produce the AGENT span for a sync execution."""
-
-    def __init__(self, tracer):
-        self._tracer = tracer
-
-    def __call__(self, wrapped, instance, args, kwargs):
+def _remove_bridge(setter_cls: type, originals: dict[str, Any]) -> None:
+    for name, descriptor in originals.items():
         try:
-            agent_name = _agent_name(instance)
-            span_cm = self._tracer.start_as_current_span(
-                f"{_OP_INVOKE_AGENT} {agent_name}",
-                kind=SpanKind.INTERNAL,
-            )
-        except Exception:  # pragma: no cover - defensive: never break the app
-            logger.debug(
-                "agentUniverse instrumentation could not start a span",
-                exc_info=True,
-            )
-            return wrapped(*args, **kwargs)
-
-        with span_cm as span:
-            _safe_set_attributes(span, agent_name, kwargs)
-
-            try:
-                result = wrapped(*args, **kwargs)
-            except Exception as exc:
-                _safe_record_exception(span, exc)
-                raise
-
-            _safe_set_ok(span)
-            return result
-
-
-class _AsyncRunWrapper:
-    """Wrap ``Agent.async_run`` to produce the AGENT span for an async run."""
-
-    def __init__(self, tracer):
-        self._tracer = tracer
-
-    async def __call__(self, wrapped, instance, args, kwargs):
-        try:
-            agent_name = _agent_name(instance)
-            span_cm = self._tracer.start_as_current_span(
-                f"{_OP_INVOKE_AGENT} {agent_name}",
-                kind=SpanKind.INTERNAL,
-            )
-        except Exception:  # pragma: no cover - defensive: never break the app
-            logger.debug(
-                "agentUniverse instrumentation could not start a span",
-                exc_info=True,
-            )
-            return await wrapped(*args, **kwargs)
-
-        with span_cm as span:
-            _safe_set_attributes(span, agent_name, kwargs)
-
-            try:
-                result = await wrapped(*args, **kwargs)
-            except Exception as exc:
-                _safe_record_exception(span, exc)
-                raise
-
-            _safe_set_ok(span)
-            return result
-
-
-# ===========================================================================
-# Wrap / unwrap helpers
-# ===========================================================================
-
-
-def _wrap_method(cls, name: str, wrapper) -> bool:
-    """Wrap ``cls.<name>`` exactly once (idempotent via sentinel)."""
-    own = cls.__dict__.get(name)
-    if own is None:
-        return False
-    if getattr(own, _AGENTUNIVERSE_MARKER, False):
-        return False
-    try:
-        wrap_function_wrapper(cls, name, wrapper)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Could not wrap %s.%s: %s", cls.__name__, name, exc)
-        return False
-    new = cls.__dict__.get(name)
-    if new is not None:
-        try:
-            setattr(new, _AGENTUNIVERSE_MARKER, True)
-        except Exception:  # pragma: no cover - defensive
-            pass
-    return True
-
-
-def _unwrap_method(cls, name: str) -> None:
-    own = cls.__dict__.get(name)
-    if own is None or not getattr(own, _AGENTUNIVERSE_MARKER, False):
-        return
-    # Drop the marker first so it does not survive onto the restored original
-    # and make a later re-instrument look like it is already wrapped.
-    try:
-        delattr(own, _AGENTUNIVERSE_MARKER)
-    except (AttributeError, TypeError):
-        pass
-    try:
-        unwrap(cls, name)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Could not unwrap %s.%s: %s", cls.__name__, name, exc)
-
-
-# ===========================================================================
-# Instrumentor
-# ===========================================================================
+            setattr(setter_cls, name, descriptor)
+        except (
+            Exception
+        ):  # defensive: instrumentation must never break the app
+            logger.debug("could not restore %s", name, exc_info=True)
 
 
 class AgentUniverseInstrumentor(BaseInstrumentor):
-    """Instrumentor for the agentUniverse agent framework."""
+    """Compatibility bridge over agentUniverse's native instrumentation.
+
+    ``Agent.run`` / ``Agent.async_run`` are never wrapped: the native
+    ``AgentInstrumentor`` owns the span and this instrumentor only augments it.
+    """
 
     def __init__(self):
         super().__init__()
-        # BaseInstrumentor.__new__ returns a singleton, so __init__ may run
-        # again on a later AgentUniverseInstrumentor() call. Only seed the
-        # bookkeeping the first time, or a stray construct-after-instrument
-        # would clear the active wrapper state.
-        if not hasattr(self, "_agentuniverse_initialized"):
-            self._agentuniverse_initialized = True
-            self._agent = None
-            self._wrapped_methods = []
-            self._wrappers = {}
+        # BaseInstrumentor.__new__ returns a singleton, so __init__ runs again on
+        # every AgentUniverseInstrumentor() call. Seed the bookkeeping once only,
+        # or a stray construct-after-instrument would erase the state that
+        # uninstrument() needs.
+        if not hasattr(self, "_agentuniverse_bridge_ready"):
+            self._agentuniverse_bridge_ready = True
+            self._native = None
+            self._native_owned = False
+            self._setter_cls = None
+            self._originals: dict[str, Any] = {}
+            self._content_mode = ContentCapturingMode.NO_CONTENT
 
     def instrumentation_dependencies(self) -> Collection[str]:
         return _instruments
 
     def _instrument(self, **kwargs: Any) -> None:
-        from agentuniverse.agent.agent import Agent
+        try:
+            from agentuniverse.base.annotation import trace as trace_module
+            from agentuniverse.base.tracing.otel.instrumentation.agent.agent_instrumentor import (  # noqa: E501
+                AgentInstrumentor,
+                AgentSpanAttributesSetter,
+            )
+        except Exception:
+            logger.warning(
+                "agentUniverse native AgentInstrumentor is unavailable; the "
+                "LoongSuite compatibility bridge stays inactive",
+                exc_info=True,
+            )
+            return
 
-        tracer_provider = kwargs.get("tracer_provider")
-        tracer = trace_api.get_tracer(
-            __name__, "", tracer_provider=tracer_provider
-        )
+        try:
+            self._content_mode = get_content_capturing_mode()
+        except Exception:  # defensive: never break the caller's instrument()
+            logger.debug(
+                "could not resolve the GenAI capture mode", exc_info=True
+            )
+            self._content_mode = ContentCapturingMode.NO_CONTENT
+        self._setter_cls = AgentSpanAttributesSetter
 
-        self._agent = Agent
-        self._wrapped_methods = []
-        self._wrappers = {}
-        wrappers = (
-            ("run", _RunWrapper(tracer)),
-            ("async_run", _AsyncRunWrapper(tracer)),
+        # Span creation is delegated: reuse the native instrumentor when the
+        # application already enabled it, otherwise own the one we create.
+        self._native = _find_active_native(trace_module, AgentInstrumentor)
+        self._native_owned = self._native is None
+        if self._native_owned:
+            self._native = AgentInstrumentor()
+            self._native.instrument(
+                tracer_provider=kwargs.get("tracer_provider"),
+                meter_provider=kwargs.get("meter_provider"),
+                skip_dep_check=True,
+            )
+
+        self._originals = _install_bridge(
+            AgentSpanAttributesSetter,
+            self._content_mode in _CONTENT_ON_SPAN_MODES,
         )
-        for method_name, wrapper in wrappers:
-            self._wrappers[method_name] = wrapper
-            if _wrap_method(Agent, method_name, wrapper):
-                self._wrapped_methods.append(method_name)
 
     def _uninstrument(self, **kwargs: Any) -> None:
-        agent = self._agent
-        if agent is not None:
-            for method_name in _TARGET_METHODS:
-                _unwrap_method(agent, method_name)
+        if self._originals and self._setter_cls is not None:
+            _remove_bridge(self._setter_cls, self._originals)
+        self._originals = {}
+        self._setter_cls = None
 
-        self._agent = None
-        self._wrapped_methods = []
-        self._wrappers = {}
+        # Only tear down the native instrumentor if this bridge created it.
+        if self._native_owned and self._native is not None:
+            try:
+                self._native.uninstrument()
+            except (
+                Exception
+            ):  # defensive: instrumentation must never break the app
+                logger.debug(
+                    "could not uninstrument the native bridge", exc_info=True
+                )
+        self._native = None
+        self._native_owned = False
+        self._content_mode = ContentCapturingMode.NO_CONTENT

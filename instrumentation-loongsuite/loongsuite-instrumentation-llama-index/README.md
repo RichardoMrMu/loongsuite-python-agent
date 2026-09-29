@@ -39,10 +39,18 @@ LlamaIndexInstrumentor().instrument()
 
 ## Content capture
 
-Message text is captured on span attributes by default. To suppress
-`gen_ai.input.messages` / `gen_ai.output.messages` while keeping the
-structural spans and token metrics:
+Message content is governed entirely by the shared `opentelemetry-util-genai`
+setting and **defaults to no content** (`NO_CONTENT`). To capture
+`gen_ai.input.messages` / `gen_ai.output.messages` on spans (and/or the
+matching gen-ai events), opt in with the shared switch:
 
 ```bash
-export OTEL_INSTRUMENTATION_LLAMA_INDEX_CAPTURE_CONTENT=false
+# span attributes only
+export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=span_only
+# span attributes + structured gen-ai events
+export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=span_and_event
 ```
+
+There is no package-specific `OTEL_INSTRUMENTATION_LLAMA_INDEX_CAPTURE_CONTENT`
+switch; content capture is managed consistently with the other LoongSuite
+instrumentations through the shared GenAI util.

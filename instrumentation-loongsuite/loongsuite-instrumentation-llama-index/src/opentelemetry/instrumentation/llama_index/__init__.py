@@ -437,7 +437,12 @@ def _build_rerank_invocation() -> Any:
 
 
 def _enrich_llm_response(invocation: LLMInvocation, response: Any) -> None:
-    """Populate an LLM invocation from a LlamaIndex chat/completion response."""
+    """Populate an LLM invocation from a LlamaIndex chat/completion response.
+
+    Chat/completion end events pass a response object (``.message.content`` or
+    ``.text``); predict/structured-predict end events pass the generated output
+    directly, which is commonly a plain string.
+    """
     if response is None:
         return
     message = getattr(response, "message", None)
@@ -449,6 +454,8 @@ def _enrich_llm_response(invocation: LLMInvocation, response: Any) -> None:
         invocation.output_messages = [
             _output_message(getattr(response, "text"))
         ]
+    elif isinstance(response, str):
+        invocation.output_messages = [_output_message(response)]
     raw = getattr(response, "raw", None)
     usage = _extract_usage(raw) or _extract_usage(response)
     if "input" in usage:
@@ -680,30 +687,45 @@ def _build_span_handler(genai_handler: Any):
                 )
 
         # -- parenting -----------------------------------------------------
-        def _parent_context(
-            self, parent_span_id: Optional[str]
+        def _parent_context_locked(
+            self,
+            parent_span_id: Optional[str],
+            parents: Optional[dict[str, Optional[str]]] = None,
         ) -> Optional[Any]:
             """Nearest handler-owned ancestor, walking skipped spans.
 
-            Skipped LlamaIndex spans (agent-internal steps, the agent's
-            ``call_tool`` orchestration) have no record of their own, so walk
-            the recorded parent chain until the nearest span the handler
-            actually opened. This keeps every TOOL span nested directly under
-            the one AGENT span even when several un-instrumented orchestration
-            spans sit between them.
+            Caller MUST hold ``self._lock()``. Skipped LlamaIndex spans
+            (agent-internal steps, the agent's ``call_tool`` orchestration)
+            have no record of their own, so walk the recorded parent chain
+            until the nearest span the handler actually opened. This keeps
+            every TOOL span nested directly under the one AGENT span even when
+            several un-instrumented orchestration spans sit between them.
+
+            ``parents`` is the in-lock snapshot to walk; ``records`` is read
+            straight from the map under the same lock so this is safe to call
+            from inside the atomic ``new_span`` critical section.
             """
+            records = self._records_map()
+            if parents is None:
+                parents = self._parents_map()
             seen: set[str] = set()
             current = parent_span_id
-            with self._lock():
-                parents = dict(self._parents_map())
             while current and current not in seen:
                 seen.add(current)
-                record = self.record_for(current)
+                record = records.get(current)
                 if record is not None and record.invocation.span is not None:
                     return trace_api.set_span_in_context(
                         record.invocation.span
                     )
                 current = parents.get(current)
+            return None
+
+        def _parent_context(
+            self, parent_span_id: Optional[str]
+        ) -> Optional[Any]:
+            """Lock-acquiring wrapper around ``_parent_context_locked``."""
+            with self._lock():
+                return self._parent_context_locked(parent_span_id)
 
         # -- lifecycle -----------------------------------------------------
         def new_span(
@@ -715,38 +737,47 @@ def _build_span_handler(genai_handler: Any):
             tags: Optional[dict[str, Any]] = None,
             **kwargs: Any,
         ):
+            # Register the parent edge, gate on the stopped flag and publish
+            # the record under one lock. Otherwise a concurrent
+            # ``stop_and_drain()`` could run between the stopped check and the
+            # record insertion, snapshotting an empty map and stranding this
+            # span (exit/drop are only dispatched to attached handlers).
             with self._lock():
-                self._parents_map()[id_] = parent_span_id
+                parents = self._parents_map()
+                parents[id_] = parent_span_id
 
-            if self._stopped():
-                return None
+                if self._stopped():
+                    return None
 
-            prefix = _span_id_prefix(id_)
-            kind = _classify(prefix)
-            if kind is None:
-                return None
+                prefix = _span_id_prefix(id_)
+                kind = _classify(prefix)
+                if kind is None:
+                    return None
 
-            try:
-                invocation = self._build_invocation(
-                    kind, bound_args, instance, prefix
+                try:
+                    invocation = self._build_invocation(
+                        kind, bound_args, instance, prefix
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Failed to build invocation for %s: %s", id_, exc
+                    )
+                    return None
+
+                parent_ctx = self._parent_context_locked(
+                    parent_span_id, parents
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Failed to build invocation for %s: %s", id_, exc)
-                return None
+                record = _SpanRecord(kind, invocation)
+                started = _safe(
+                    getattr(self._genai(), _START_METHODS[kind]),
+                    invocation,
+                    context=parent_ctx,
+                )
+                if started is None:
+                    # start_* raised: create no record so exit/drop are no-ops
+                    # and the business call proceeds completely untouched.
+                    return None
 
-            parent_ctx = self._parent_context(parent_span_id)
-            record = _SpanRecord(kind, invocation)
-            started = _safe(
-                getattr(self._genai(), _START_METHODS[kind]),
-                invocation,
-                context=parent_ctx,
-            )
-            if started is None:
-                # start_* raised: create no record so exit/drop are no-ops and
-                # the business call proceeds completely untouched.
-                return None
-
-            with self._lock():
                 self._records_map()[id_] = record
             return None
 
@@ -919,15 +950,16 @@ def _build_event_handler(span_handler: Any):
                     if model and not invocation.request_model:
                         invocation.request_model = str(model)
             elif name.endswith("EndEvent"):
+                # Chat/completion end events carry the generated response in
+                # ``response``; predict/structured-predict end events carry it
+                # in ``output``. ``messages`` on a chat end event is the
+                # *request* messages, so it must never be used as the output
+                # (doing so reported the user prompt as gen_ai.output).
                 response = getattr(event, "response", None)
+                if response is None:
+                    response = getattr(event, "output", None)
                 if response is not None:
                     _enrich_llm_response(invocation, response)
-                messages = getattr(event, "messages", None)
-                if messages and not invocation.output_messages:
-                    invocation.output_messages = [
-                        _output_message(getattr(m, "content", ""))
-                        for m in messages
-                    ]
 
     return _LoongSuiteEventHandler(span_handler)
 

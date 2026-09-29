@@ -16,17 +16,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   future-defined executor subclasses), complementing — rather than
   duplicating — the SDK's built-in transport/request-handler tracing.
   ([#28](https://github.com/alibaba/loongsuite-python/issues/28))
-- Span kind and content-capture are sourced from the shared GenAI util
-  (`opentelemetry-util-genai`): the span kind comes from `GenAiSpanKindValues`
-  and content capture is governed by the standard
-  `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` switch (default
-  `NO_CONTENT`), so user prompts are never exported without explicit opt-in.
-- Task context available at the execution boundary is attached using the A2A
-  semantic-conventions draft keys `a2a.task.id` / `a2a.task.state`
-  ([semantic-conventions-genai#195](https://github.com/open-telemetry/semantic-conventions-genai/pull/195)),
-  keeping agent execution distinct from A2A protocol operations; full protocol
-  instrumentation can follow separately.
-- Telemetry is fail-safe: any error while recording span attributes is
-  swallowed so instrumentation can never interrupt agent execution.
-- The AGENT span name uses the concrete executor class
-  (`invoke_agent {ClassName}`), matching sibling agent instrumentations.
+- The agent execution span is owned end-to-end by the shared
+  `opentelemetry-util-genai` `ExtendedTelemetryHandler`: the
+  instrumentation builds an `InvokeAgentInvocation` at the executor
+  boundary and drives it through `start_invoke_agent` /
+  `stop_invoke_agent` / `fail_invoke_agent`, so span start/end,
+  attributes, content capture, events, metrics and error recording all
+  come from the shared util.
+- An additional `a2a.execute` span of kind `INTERNAL` marks the
+  executor-machinery boundary the AGENT span nests under; it carries
+  no gen-ai semantics. No client-side or A2A protocol spans are
+  produced.
+- The A2A `contextId` is mapped to the standard
+  `gen_ai.conversation.id` attribute (via
+  `InvokeAgentInvocation.conversation_id`), aligned with the A2A
+  semantic-conventions draft
+  ([semantic-conventions-genai#195](https://github.com/open-telemetry/semantic-conventions-genai/pull/195)).
+  Task id/state remain attached via the draft's `a2a.task.id` /
+  `a2a.task.state` keys, set on the handler-owned span.
+- Content capture (span, event and the `EVENT_ONLY`
+  details-event-only mode) and `NO_CONTENT` default are governed
+  entirely by the shared GenAI util via
+  `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`, so user
+  prompts are never exported without explicit opt-in.
+
+### Changed
+
+- Every telemetry step — boundary span, invocation construction,
+  handler start/stop/fail, attribute and error recording — is fully
+  fail-safe: a telemetry error never blocks the executor, never alters
+  its result, and never replaces the business exception (the original
+  exception is re-raised unchanged).

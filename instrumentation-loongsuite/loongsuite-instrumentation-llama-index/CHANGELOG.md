@@ -33,3 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `uninstrument()` no longer strands spans that were open when it ran: the
   handler stops creating new spans and drains (ends) any still-open spans
   before it is detached from the dispatcher.
+- The stopped gate and the record publication in `new_span` now run inside the
+  same lock that snapshots open spans during `uninstrument()`, so a
+  `new_span`/drain race can no longer register a span the drain will miss.
+- A `LLMChatEndEvent` without a generated `response` no longer reports the
+  event's request `messages` as `gen_ai.output.messages`; predict and
+  structured-predict end events are enriched from their `output` field
+  (including a plain-string output) instead.

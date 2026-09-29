@@ -23,9 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stop_invoke_agent` / `fail_invoke_agent`, so span start/end,
   attributes, content capture, events, metrics and error recording all
   come from the shared util.
-- An additional `a2a.execute` span of kind `INTERNAL` marks the
-  executor-machinery boundary the AGENT span nests under; it carries
-  no gen-ai semantics. No client-side or A2A protocol spans are
+- No extra structural span is emitted: the handler-owned `invoke_agent`
+  AGENT span is itself the single executor-boundary span (matching the
+  Hermes instrumentation). No client-side or A2A protocol spans are
   produced.
 - The A2A `contextId` is mapped to the standard
   `gen_ai.conversation.id` attribute (via
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Every telemetry step — boundary span, invocation construction,
+- Every telemetry step — invocation construction,
   handler start/stop/fail, attribute and error recording — is fully
   fail-safe: a telemetry error never blocks the executor, never alters
   its result, and never replaces the business exception (the original

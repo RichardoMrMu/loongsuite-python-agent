@@ -29,9 +29,9 @@ The agent execution span is *owned* by the shared
 only builds an ``InvokeAgentInvocation`` at the executor boundary and drives
 it through ``start_invoke_agent`` / ``stop_invoke_agent`` /
 ``fail_invoke_agent``; it never starts, ends, records errors on, or sets
-attributes on the AGENT span itself. An additional ``a2a.execute`` span of
-kind ``INTERNAL`` marks the executor-machinery boundary that everything
-nests under; it carries no gen-ai semantics.
+attributes on the AGENT span itself and adds no extra structural span, so
+the handler's ``invoke_agent`` span is the single executor-boundary span
+(matching the Hermes agent instrumentation).
 
 Scope: agent execution, not the A2A protocol
 --------------------------------------------
@@ -77,7 +77,7 @@ restores the original ``__init_subclass__``.
 
 Fail-safety
 ------------
-Every telemetry step -- boundary span, invocation construction,
+Every telemetry step -- invocation construction,
 handler start/stop/fail, attribute and error recording -- is wrapped so a
 telemetry failure can never block the executor, alter its result, or replace
 its business exception: on failure the original exception is re-raised
@@ -99,11 +99,9 @@ from typing import Any, Optional
 from wrapt import wrap_function_wrapper
 
 from opentelemetry import context as otel_context
-from opentelemetry import trace as trace_api
 from opentelemetry.instrumentation.a2a.package import _instruments
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.utils import unwrap
-from opentelemetry.trace import SpanKind
 from opentelemetry.util.genai.extended_types import (
     InvokeAgentInvocation,
 )
@@ -113,10 +111,6 @@ logger = logging.getLogger(__name__)
 
 # -- Framework identifier -----------------------------------------------------
 _FRAMEWORK = "a2a"
-
-# The executor-machinery boundary span; INTERNAL, no gen-ai semantics. The
-# AGENT execution span itself is the handler's ``invoke_agent`` span.
-_BOUNDARY_SPAN_NAME = "a2a.execute"
 
 # -- A2A protocol context keys (aligned with semantic-conventions-genai #195) -
 # Only the stable task context available at the execution boundary; the full
@@ -226,16 +220,12 @@ def _build_invocation(context: Any, agent_name: str) -> InvokeAgentInvocation:
 class _ExecuteWrapper:
     """Wrap ``AgentExecutor.execute`` with handler-owned agent telemetry.
 
-    Layout, outside in:
-
-    * an ``INTERNAL`` ``a2a.execute`` span marking the executor
-      boundary (purely structural; no gen-ai semantics);
-    * the shared handler's ``invoke_agent`` AGENT span, whose full
-      lifecycle is owned by ``ExtendedTelemetryHandler``.
+    The shared handler's ``invoke_agent`` AGENT span owns the full span
+    lifecycle (matching the Hermes instrumentation); this wrapper adds no
+    structural span of its own.
     """
 
-    def __init__(self, tracer, handler):
-        self._tracer = tracer
+    def __init__(self, handler):
         self._handler = handler
 
     async def __call__(self, wrapped, instance, args, kwargs):
@@ -247,85 +237,50 @@ class _ExecuteWrapper:
         return await self._run(wrapped, args, kwargs, context, agent_name)
 
     async def _run(self, wrapped, args, kwargs, context, agent_name) -> Any:
-        # 1) INTERNAL executor-boundary span (structural only).
-        boundary = None
-        try:
-            boundary = self._tracer.start_span(
-                _BOUNDARY_SPAN_NAME, kind=SpanKind.INTERNAL
-            )
-            boundary_token = otel_context.attach(
-                trace_api.set_span_in_context(
-                    boundary, otel_context.get_current()
-                )
-            )
-        except Exception:
-            logger.debug(
-                "A2A instrumentation: boundary span start failed",
-                exc_info=True,
-            )
-            boundary = None
-            boundary_token = None
-
-        # 2) Build the invocation (fail-safe) and let the handler
-        #    own the AGENT span lifecycle.
+        # Build the invocation (fail-safe) and let the shared
+        # ExtendedTelemetryHandler own the whole AGENT span lifecycle, matching
+        # the Hermes instrumentation (no extra structural span).
         invocation = None
         started = False
         try:
-            try:
-                invocation = _build_invocation(context, agent_name)
-            except Exception:
-                logger.debug(
-                    "A2A instrumentation: invocation build failed",
-                    exc_info=True,
-                )
-                # Keep handler telemetry alive even if context
-                # extraction itself blows up.
-                invocation = InvokeAgentInvocation(
-                    provider=_FRAMEWORK, agent_name=agent_name
-                )
-            try:
-                self._handler.start_invoke_agent(
-                    invocation, context=otel_context.get_current()
-                )
-                started = True
-            except Exception:
-                logger.debug(
-                    "A2A instrumentation: start_invoke_agent failed",
-                    exc_info=True,
-                )
-                # The handler may have attached a span before the
-                # failure; end it best-effort so nothing leaks.
-                span = getattr(invocation, "span", None)
-                if span is not None:
-                    try:
-                        span.end()
-                    except Exception:  # pragma: no cover - defensive
-                        logger.debug("A2A instrumentation: cleanup end failed")
-
-            try:
-                result = await wrapped(*args, **kwargs)
-            except Exception as business_error:
-                self._fail(invocation, started, business_error)
-                raise
-
-            self._stop(invocation, started)
-            return result
-        finally:
-            if boundary is not None:
-                if boundary_token is not None:
-                    try:
-                        otel_context.detach(boundary_token)
-                    except Exception:  # pragma: no cover - defensive
-                        logger.debug(
-                            "A2A instrumentation: boundary detach failed"
-                        )
+            invocation = _build_invocation(context, agent_name)
+        except Exception:
+            logger.debug(
+                "A2A instrumentation: invocation build failed",
+                exc_info=True,
+            )
+            # Keep handler telemetry alive even if context extraction
+            # itself blows up.
+            invocation = InvokeAgentInvocation(
+                provider=_FRAMEWORK, agent_name=agent_name
+            )
+        try:
+            self._handler.start_invoke_agent(
+                invocation, context=otel_context.get_current()
+            )
+            started = True
+        except Exception:
+            logger.debug(
+                "A2A instrumentation: start_invoke_agent failed",
+                exc_info=True,
+            )
+            # The handler may have attached a span before the failure;
+            # end it best-effort so nothing leaks.
+            span = getattr(invocation, "span", None)
+            if span is not None:
                 try:
-                    boundary.end()
+                    span.end()
                 except Exception:  # pragma: no cover - defensive
-                    logger.debug(
-                        "A2A instrumentation: boundary span end failed",
-                        exc_info=True,
-                    )
+                    logger.debug("A2A instrumentation: cleanup end failed")
+
+        try:
+            result = await wrapped(*args, **kwargs)
+        except Exception as business_error:
+            self._fail(invocation, started, business_error)
+            raise
+
+        self._stop(invocation, started)
+        return result
 
     def _stop(self, invocation, started: bool) -> None:
         if not started or invocation is None:
@@ -449,10 +404,7 @@ class A2AInstrumentor(BaseInstrumentor):
             tracer_provider=tracer_provider,
             logger_provider=logger_provider,
         )
-        tracer = trace_api.get_tracer(
-            __name__, "", tracer_provider=tracer_provider
-        )
-        wrapper = _ExecuteWrapper(tracer, handler)
+        wrapper = _ExecuteWrapper(handler)
         self._wrapper = wrapper
         self._base = AgentExecutor
         self._wrapped_classes = []

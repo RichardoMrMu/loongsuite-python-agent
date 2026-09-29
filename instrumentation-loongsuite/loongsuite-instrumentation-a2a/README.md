@@ -16,8 +16,9 @@ The AGENT span is owned end-to-end by the shared
 `InvokeAgentInvocation` at the executor boundary and drives it through
 `start_invoke_agent` / `stop_invoke_agent` / `fail_invoke_agent`. It never
 starts, ends, records errors on, or sets attributes on the AGENT span
-itself. A separate `a2a.execute` span of kind `INTERNAL` marks the
-executor-machinery boundary the AGENT span nests under.
+itself and adds no extra structural span, matching the Hermes agent
+instrumentation; the handler's `invoke_agent` span is the single
+executor-boundary span.
 
 It is **complementary** to the tracing already built into `a2a-sdk`
 (`a2a.utils.telemetry`): the SDK traces protocol plumbing under the
@@ -80,7 +81,7 @@ export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=EVENT_ONLY
 
 ## Fail-safety
 
-Every telemetry step (boundary span, invocation construction, handler
+Every telemetry step (invocation construction, handler
 start/stop/fail, attribute setting and error recording) is fail-safe. A
 telemetry failure never blocks the executor, never alters the A2A result, and
 never replaces the business exception: on failure the original exception is

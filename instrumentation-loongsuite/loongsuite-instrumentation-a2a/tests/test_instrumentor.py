@@ -58,7 +58,6 @@ from opentelemetry.util.genai.extended_semconv.gen_ai_extended_attributes import
 )
 
 _AGENT = GenAiSpanKindValues.AGENT.value
-_INTERNAL_BOUNDARY = "a2a.execute"
 
 
 # ---------------------------------------------------------------------------
@@ -122,10 +121,6 @@ def _agent_spans(spans):
     return [s for s in spans if s.attributes.get(GEN_AI_SPAN_KIND) == _AGENT]
 
 
-def _boundary_spans(spans):
-    return [s for s in spans if s.name == _INTERNAL_BOUNDARY]
-
-
 # ---------------------------------------------------------------------------
 # RED: no telemetry without instrumentation
 # ---------------------------------------------------------------------------
@@ -139,7 +134,7 @@ async def test_red_no_spans_without_instrumentation(span_exporter):
 
     names = [s.name for s in span_exporter.get_finished_spans()]
     assert not any(n.startswith("invoke_agent") for n in names), names
-    assert _INTERNAL_BOUNDARY not in names, names
+    assert "a2a.execute" not in names, names
 
 
 # ---------------------------------------------------------------------------
@@ -205,18 +200,16 @@ async def test_green_inner_work_nests_under_agent(
     await _run(ExecCls())
 
     spans = span_exporter.get_finished_spans()
-    assert len(spans) == 3, [s.name for s in spans]
+    assert len(spans) == 2, [s.name for s in spans]
 
     agent = _agent_spans(spans)[0]
-    boundary = _boundary_spans(spans)[0]
     inner = next(s for s in spans if s.name == "agent-inner-work")
 
-    # Inner executor work nests under the AGENT span; the AGENT span
-    # nests inside the INTERNAL executor-boundary span.
+    # The handler owns the whole boundary now, so inner executor work nests
+    # directly under the single invoke_agent AGENT span (no structural span).
     assert inner.parent.span_id == agent.context.span_id
     assert inner.context.trace_id == agent.context.trace_id
-    assert agent.parent.span_id == boundary.context.span_id
-    assert boundary.kind == SpanKind.INTERNAL
+    assert agent.kind == SpanKind.INTERNAL
 
 
 # ---------------------------------------------------------------------------
@@ -442,38 +435,6 @@ async def test_fault_fail_invoke_agent_keeps_original_exception(
 
 
 @pytest.mark.asyncio
-async def test_fault_boundary_span_start_does_not_block(
-    instrument, monkeypatch
-):
-    """Even the outer INTERNAL boundary span start is fail-safe."""
-    from opentelemetry.instrumentation import a2a as a2a_pkg
-
-    class _ExplodingTracer:
-        def start_span(self, *args, **kwargs):
-            raise RuntimeError("tracer start exploded")
-
-        def start_as_current_span(self, *args, **kwargs):
-            raise RuntimeError("tracer start exploded")
-
-    monkeypatch.setattr(
-        a2a_pkg.trace_api,
-        "get_tracer",
-        lambda *args, **kwargs: _ExplodingTracer(),
-    )
-
-    class _PlainExec(AgentExecutor):
-        async def execute(self, context, event_queue):
-            return "ok"
-
-        async def cancel(self, context, event_queue):
-            return None
-
-    assert (
-        await _PlainExec().execute(_real_request_context(), object()) == "ok"
-    )
-
-
-@pytest.mark.asyncio
 async def test_fault_invocation_build_keeps_business_intact(instrument):
     """Context access exploding while building the invocation is fail-safe."""
 
@@ -509,8 +470,7 @@ async def test_no_client_or_protocol_spans(instrument, span_exporter):
 
     spans = span_exporter.get_finished_spans()
     names = [s.name for s in spans]
-    agent_name = next(n for n in names if n.startswith("invoke_agent"))
-    assert sorted(names) == sorted([_INTERNAL_BOUNDARY, agent_name]), names
+    assert len(names) == 1 and names[0].startswith("invoke_agent"), names
     for span in spans:
         assert span.kind != SpanKind.CLIENT
         assert span.kind != SpanKind.SERVER
@@ -547,7 +507,7 @@ async def test_red_uninstrument_restores_executor(
     await _run(ExecCls2())
     names = [s.name for s in span_exporter.get_finished_spans()]
     assert not any(n.startswith("invoke_agent") for n in names), names
-    assert _INTERNAL_BOUNDARY not in names
+    assert "a2a.execute" not in names
 
 
 @pytest.mark.asyncio

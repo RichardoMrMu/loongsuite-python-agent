@@ -14,13 +14,26 @@
 
 """Tests for LlamaIndexInstrumentor.
 
-Every span-producing assertion has a paired RED check: without the
-instrumentor active (before ``instrument`` / after ``uninstrument``), the
-same LlamaIndex call produces **zero** OTel spans. This guards against the
-test passing for reasons unrelated to the instrumentation.
+These tests drive the *real* ``llama-index-core`` dispatcher with real
+``MockLLM`` / ``MockEmbedding`` stubs and a real workflow ``ReActAgent``
+(scripted streaming model + a real ``FunctionTool``); only the model output
+is scripted. They assert that:
+
+  * the shared ``ExtendedTelemetryHandler`` owns one ``invoke_agent`` AGENT
+    span per real agent run and one ``execute_tool`` TOOL span per tool
+    execution, with correct nesting;
+  * agent-internal setup/parse/step/call_tool orchestration produces no
+    AGENT (and no extra) spans; a non-agent LLM call is an LLM span;
+  * all four content-capture modes behave through the shared handler,
+    including EVENT_ONLY (log event, no span content);
+  * telemetry faults (start/stop/set_attribute raising) never block the
+    business run, change its result, or replace a business exception;
+  * uninstrument drains open spans and stops span production.
 """
 
 from __future__ import annotations
+
+from importlib.metadata import requires
 
 import pytest
 
@@ -29,7 +42,6 @@ from opentelemetry.instrumentation.llama_index import (
     _GEN_AI_OPERATION_NAME,
     _GEN_AI_SPAN_KIND,
     _SPAN_KIND_AGENT,
-    _SPAN_KIND_CHAIN,
     _SPAN_KIND_EMBEDDING,
     _SPAN_KIND_LLM,
     _SPAN_KIND_TOOL,
@@ -37,6 +49,14 @@ from opentelemetry.instrumentation.llama_index import (
     _classify,
     _span_id_prefix,
 )
+from opentelemetry.semconv._incubating.attributes import (
+    gen_ai_attributes as GenAI,
+)
+
+CAPTURE_ENVVAR = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
+INPUT_MESSAGES_KEY = GenAI.GEN_AI_INPUT_MESSAGES
+OUTPUT_MESSAGES_KEY = GenAI.GEN_AI_OUTPUT_MESSAGES
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -55,8 +75,73 @@ def _chat_once(llm):
     return llm.chat([ChatMessage(role="user", content="hi there")])
 
 
+def _spans_by_kind(span_exporter):
+    spans = span_exporter.get_finished_spans()
+    grouped: dict[str, list] = {}
+    for span in spans:
+        kind = span.attributes.get(_GEN_AI_SPAN_KIND)
+        grouped.setdefault(kind, []).append(span)
+    return grouped
+
+
+def _make_react_llm(boom: bool = False):
+    """A streaming MockLLM that drives one tool call then a final answer.
+
+    Workflow agents consume ``astream_chat`` streams; only the model output
+    is scripted -- every framework event/span is emitted for real.
+    """
+    from llama_index.core.llms import ChatMessage, ChatResponse, MockLLM
+
+    class ScriptedReAct(MockLLM):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            object.__setattr__(self, "_calls", 0)
+
+        def _next(self):
+            calls = self._calls + 1
+            object.__setattr__(self, "_calls", calls)
+            if boom:
+                raise ValueError("business boom")
+            if calls == 1:
+                text = (
+                    "Thought: I need the weather\n"
+                    "Action: get_weather\n"
+                    'Action Input: {"city": "SF"}'
+                )
+            else:
+                text = "Thought: done\nAnswer: sunny in SF"
+            return ChatResponse(
+                message=ChatMessage(role="assistant", content=text)
+            )
+
+        async def astream_chat(self, messages, **kwargs):
+            response = self._next()
+
+            async def gen():
+                yield response
+
+            return gen()
+
+    return ScriptedReAct()
+
+
+async def _run_react_agent():
+    from llama_index.core.agent import ReActAgent
+    from llama_index.core.tools import FunctionTool
+
+    def get_weather(city: str) -> str:
+        """Useful for getting the weather for a city."""
+        return f"sunny in {city}"
+
+    agent = ReActAgent(
+        tools=[FunctionTool.from_defaults(fn=get_weather)],
+        llm=_make_react_llm(),
+    )
+    return await agent.run("what is the weather in SF?")
+
+
 # ---------------------------------------------------------------------------
-# Pure classification unit tests (no dispatcher needed)
+# Pure classification unit tests
 # ---------------------------------------------------------------------------
 
 
@@ -69,45 +154,59 @@ def test_span_id_prefix_strips_uuid():
 
 
 @pytest.mark.parametrize(
-    "prefix,expected_kind",
+    "prefix,expected",
     [
-        ("MockLLM.chat", _SPAN_KIND_LLM),
-        ("OpenAI.complete", _SPAN_KIND_LLM),
-        ("MockEmbedding.get_text_embedding", _SPAN_KIND_EMBEDDING),
-        ("VectorIndexRetriever.retrieve", "RETRIEVER"),
-        ("LLMRerank.postprocess_nodes", "RERANKER"),
-        ("CompactAndRefine.synthesize", "TASK"),
-        ("RetrieverQueryEngine.query", "CHAIN"),
-        ("ReActAgent.run", "AGENT"),
-        # #273: agent-internal machinery must NOT inherit AGENT from the
-        # class name -- only a genuine agent invocation (run/chat) is AGENT.
-        ("FunctionAgent.call_tool", _SPAN_KIND_TOOL),
-        ("ReActAgent.call_tool", _SPAN_KIND_TOOL),
-        ("FunctionAgent.take_step", _SPAN_KIND_CHAIN),
-        ("FunctionAgent.setup_agent", _SPAN_KIND_CHAIN),
-        ("FunctionAgent.finalize", _SPAN_KIND_CHAIN),
-        ("ReActAgent.handle_tool_call_results", _SPAN_KIND_CHAIN),
-        # Copilot: async/streaming structured prediction are LLM calls.
-        ("OpenAI.astructured_predict", _SPAN_KIND_LLM),
-        ("OpenAI.stream_structured_predict", _SPAN_KIND_LLM),
-        ("OpenAI.astream_structured_predict", _SPAN_KIND_LLM),
+        # The real agent boundary.
+        ("ReActAgent.run", "agent"),
+        ("FunctionAgent.arun", "agent"),
+        ("AgentWorkflow.run", "agent"),
+        # The actual tool/function execution.
+        ("FunctionTool.call", "tool"),
+        ("FunctionTool.acall", "tool"),
+        # Model calls -- LLM, including inside agent loops / streaming.
+        ("MockLLM.chat", "llm"),
+        ("OpenAI.complete", "llm"),
+        ("MockLLM.astream_chat", "llm"),
+        ("OpenAI.astructured_predict", "llm"),
+        # Other GenAI operations.
+        ("MockEmbedding.get_text_embedding", "embedding"),
+        ("VectorIndexRetriever.retrieve", "retrieval"),
+        ("LLMRerank.postprocess_nodes", "rerank"),
     ],
 )
-def test_classify(prefix, expected_kind):
-    kind, _op = _classify(prefix)
-    assert kind == expected_kind
+def test_classify_maps_real_operations(prefix, expected):
+    assert _classify(prefix) == expected
 
 
-def test_agent_internal_methods_are_not_agent_spans():
-    # Direct guard for the #273 review: a class named *Agent* must not turn
-    # setup/parse/call_tool into AGENT spans. call_tool is TOOL; the rest are
-    # internal steps (CHAIN), and only run/chat is the AGENT invocation.
-    assert _classify("FunctionAgent.run")[0] == _SPAN_KIND_AGENT
-    assert _classify("FunctionAgent.call_tool")[0] == _SPAN_KIND_TOOL
-    for internal in ("take_step", "setup_agent", "init_run", "finalize"):
-        kind, _op = _classify(f"FunctionAgent.{internal}")
-        assert kind != _SPAN_KIND_AGENT, internal
-        assert kind == _SPAN_KIND_CHAIN, internal
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        # Agent-internal machinery must not become AGENT spans.
+        ("FunctionAgent.setup_agent"),
+        ("BaseWorkflowAgent.init_run"),
+        ("BaseWorkflowAgent.run_agent_step"),
+        ("BaseWorkflowAgent.take_step"),
+        ("ReActOutputParser.parse"),
+        ("BaseWorkflowAgent.parse_agent_output"),
+        ("BaseWorkflowAgent.aggregate_tool_results"),
+        # The agent's own tool orchestration is not the execution.
+        ("BaseWorkflowAgent.call_tool"),
+        # The Tool.__call__ trampoline only delegates to Tool.call.
+        ("FunctionTool.__call__"),
+        # Generic query/chain steps are not standalone GenAI operations here.
+        ("RetrieverQueryEngine.query"),
+        ("CompactAndRefine.synthesize"),
+        ("RetrieverQueryEngine.synthesize"),
+    ],
+)
+def test_classify_skips_internal_and_chain_steps(prefix):
+    assert _classify(prefix) is None, prefix
+
+
+def test_internal_llm_call_is_llm_not_agent():
+    # The model turn inside an agent loop is an LLM, not another AGENT span.
+    assert _classify("MockLLM.astream_chat") == "llm"
+    assert _classify("MockLLM.stream_complete") == "llm"
 
 
 # ---------------------------------------------------------------------------
@@ -115,77 +214,127 @@ def test_agent_internal_methods_are_not_agent_spans():
 # ---------------------------------------------------------------------------
 
 
-def test_red_no_spans_without_instrumentation(span_exporter, tracer_provider):
-    """Baseline: driving an LLM chat with NO instrumentor active must not
-    produce any OTel spans on our exporter."""
-    llm = _mock_llm()
-    _chat_once(llm)
+def test_red_no_spans_without_instrumentation(span_exporter):
+    _chat_once(_mock_llm())
     assert span_exporter.get_finished_spans() == ()
 
 
 # ---------------------------------------------------------------------------
-# GREEN: spans appear and nest correctly when instrumented
+# GREEN: LLM chat spans are handler-owned LLM spans
 # ---------------------------------------------------------------------------
 
 
 def test_green_chat_produces_llm_span(instrument, span_exporter):
-    llm = _mock_llm()
-    _chat_once(llm)
+    _chat_once(_mock_llm())
+
+    grouped = _spans_by_kind(span_exporter)
+    chat_spans = grouped.get(_SPAN_KIND_LLM, [])
+    assert chat_spans, grouped.keys()
+    # The outer call is chat; the inner prompt completion is text_completion.
+    operations = {s.attributes.get(_GEN_AI_OPERATION_NAME) for s in chat_spans}
+    assert operations == {"chat", "text_completion"}, operations
+    for span in chat_spans:
+        assert span.attributes.get(_GEN_AI_FRAMEWORK) == "llama_index"
+
+
+def test_green_chat_complete_share_trace_and_exact_parent(
+    instrument, span_exporter
+):
+    """MockLLM.chat internally calls MockLLM.complete (real framework flow)."""
+    _chat_once(_mock_llm())
 
     spans = span_exporter.get_finished_spans()
-    assert len(spans) >= 1
+    assert len(spans) >= 2
 
-    chat_spans = [
-        s
-        for s in spans
-        if s.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_LLM
-    ]
-    assert chat_spans, f"no LLM span among {[s.name for s in spans]}"
-    for s in chat_spans:
-        assert s.attributes.get(_GEN_AI_FRAMEWORK) == "llama_index"
-        assert s.attributes.get(_GEN_AI_OPERATION_NAME) == "chat"
+    assert {s.context.trace_id for s in spans} and len(
+        {s.context.trace_id for s in spans}
+    ) == 1
 
+    def _find(operation: str):
+        return next(
+            s
+            for s in spans
+            if s.attributes.get(_GEN_AI_OPERATION_NAME) == operation
+        )
 
-def test_green_chat_complete_share_trace_and_nest(instrument, span_exporter):
-    """MockLLM.chat internally calls MockLLM.complete. The two spans must
-    share one trace_id and the complete span must be a child of the chat
-    span — proving parent_span_id is faithfully mapped."""
-    llm = _mock_llm()
-    _chat_once(llm)
-
-    spans = span_exporter.get_finished_spans()
-    assert len(spans) >= 2, [s.name for s in spans]
-
-    trace_ids = {s.context.trace_id for s in spans}
-    assert len(trace_ids) == 1, f"spans split across traces: {trace_ids}"
-
-    chat = next(s for s in spans if s.name.endswith(".chat"))
-    complete = next(s for s in spans if s.name.endswith(".complete"))
-
-    # Assert the EXACT parent id, not just 'some exported span': a broken
-    # parent_span_id mapping must not be able to satisfy this test.
+    chat = _find("chat")
+    complete = _find("text_completion")
+    # Handler-owned spans carry the handler's naming/kind.
+    assert chat.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_LLM
+    assert complete.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_LLM
+    # Exact parent id, not just "some exported span".
     assert complete.parent is not None
     assert complete.parent.span_id == chat.context.span_id
-    assert complete.context.trace_id == chat.context.trace_id
 
 
 def test_green_embedding_span(instrument, span_exporter):
     from llama_index.core.embeddings import MockEmbedding
 
-    emb = MockEmbedding(embed_dim=4)
-    emb.get_text_embedding("hello world")
+    MockEmbedding(embed_dim=4).get_text_embedding("hello world")
 
-    spans = span_exporter.get_finished_spans()
-    emb_spans = [
-        s
-        for s in spans
-        if s.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_EMBEDDING
-    ]
-    assert emb_spans, f"no EMBEDDING span among {[s.name for s in spans]}"
+    grouped = _spans_by_kind(span_exporter)
+    assert grouped.get(_SPAN_KIND_EMBEDDING), grouped.keys()
 
 
 # ---------------------------------------------------------------------------
-# RED after uninstrument: teardown must stop span production
+# GREEN: one AGENT + one TOOL span for a real workflow agent run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_real_agent_run_one_agent_one_tool_nested(
+    instrument, span_exporter
+):
+    response = await _run_react_agent()
+    assert "sunny in SF" in str(response)
+
+    grouped = _spans_by_kind(span_exporter)
+    agent_spans = grouped.get(_SPAN_KIND_AGENT, [])
+    tool_spans = grouped.get(_SPAN_KIND_TOOL, [])
+    llm_spans = grouped.get(_SPAN_KIND_LLM, [])
+
+    # Exactly one agent invocation for the whole run...
+    assert len(agent_spans) == 1, [s.name for s in agent_spans]
+    agent_span = agent_spans[0]
+    assert agent_span.name.startswith("invoke_agent"), agent_span.name
+    assert agent_span.attributes.get(_GEN_AI_OPERATION_NAME) == "invoke_agent"
+    assert agent_span.parent is None
+
+    # ...one tool execution, handler-named and nested directly under the
+    # agent span even though skipped orchestration spans sit between them...
+    assert len(tool_spans) == 1, [s.name for s in tool_spans]
+    tool_span = tool_spans[0]
+    assert tool_span.name.startswith("execute_tool"), tool_span.name
+    assert "get_weather" in tool_span.name
+    assert tool_span.attributes.get(_GEN_AI_OPERATION_NAME) == "execute_tool"
+    assert tool_span.parent is not None
+    assert tool_span.parent.span_id == agent_span.context.span_id
+
+    # ...and the in-loop model turns are LLM spans, also under the agent.
+    assert len(llm_spans) >= 1, grouped.keys()
+    for llm_span in llm_spans:
+        assert llm_span.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_LLM
+        assert llm_span.parent is not None
+        assert llm_span.parent.span_id == agent_span.context.span_id
+
+    # All spans share one trace.
+    all_spans = span_exporter.get_finished_spans()
+    assert len({s.context.trace_id for s in all_spans}) == 1
+
+
+@pytest.mark.asyncio
+async def test_standalone_llm_call_emits_no_agent_span(
+    instrument, span_exporter
+):
+    # A plain model call (indexing/retrieval style) must not be an agent.
+    _chat_once(_mock_llm())
+    grouped = _spans_by_kind(span_exporter)
+    assert grouped.get(_SPAN_KIND_AGENT, []) == []
+    assert grouped.get(_SPAN_KIND_LLM)
+
+
+# ---------------------------------------------------------------------------
+# Uninstrument: stops spans and drains stranded ones
 # ---------------------------------------------------------------------------
 
 
@@ -194,101 +343,236 @@ def test_red_uninstrument_stops_spans(span_exporter, tracer_provider):
     instrumentor.instrument(
         tracer_provider=tracer_provider, skip_dep_check=True
     )
-    llm = _mock_llm()
-    _chat_once(llm)
-    assert len(span_exporter.get_finished_spans()) >= 1
+    _chat_once(_mock_llm())
+    assert span_exporter.get_finished_spans()
 
     instrumentor.uninstrument()
     span_exporter.clear()
 
     _chat_once(_mock_llm())
-    assert span_exporter.get_finished_spans() == (), (
-        "spans still produced after uninstrument"
-    )
+    assert span_exporter.get_finished_spans() == ()
 
 
-# ---------------------------------------------------------------------------
-# Lifecycle: double instrument / uninstrument is safe
-# ---------------------------------------------------------------------------
-
-
-def test_instrument_is_idempotent_on_uninstrument(
-    span_exporter, tracer_provider
-):
+def test_instrument_is_idempotent_on_uninstrument():
     instrumentor = LlamaIndexInstrumentor()
-    instrumentor.instrument(
-        tracer_provider=tracer_provider, skip_dep_check=True
-    )
+    instrumentor.instrument(skip_dep_check=True)
     instrumentor.uninstrument()
-    # second uninstrument must not raise
-    instrumentor.uninstrument()
-
-
-# ---------------------------------------------------------------------------
-# Content capture is governed by the shared GenAI util's switch (#273)
-# ---------------------------------------------------------------------------
-
-
-def _chat_span(span_exporter):
-    return next(
-        s
-        for s in span_exporter.get_finished_spans()
-        if s.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_LLM
-    )
-
-
-def test_content_captured_when_shared_util_enables_span_content(
-    instrument, span_exporter, monkeypatch
-):
-    # SPAN_ONLY via the standard shared-util env => input messages on the span.
-    monkeypatch.setenv(
-        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY"
-    )
-    _chat_once(_mock_llm())
-    span = _chat_span(span_exporter)
-    assert "gen_ai.input.messages" in span.attributes
-
-
-def test_content_suppressed_when_shared_util_disables_content(
-    instrument, span_exporter, monkeypatch
-):
-    # NO_CONTENT (the shared-util default) => structural span but no messages.
-    monkeypatch.setenv(
-        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "NO_CONTENT"
-    )
-    _chat_once(_mock_llm())
-    span = _chat_span(span_exporter)
-    assert "gen_ai.input.messages" not in span.attributes
-    assert "gen_ai.output.messages" not in span.attributes
-    # the structural span itself is still emitted
-    assert span.attributes.get(_GEN_AI_FRAMEWORK) == "llama_index"
-
-
-# ---------------------------------------------------------------------------
-# Uninstrument must not strand spans that were open when it ran (Copilot #2)
-# ---------------------------------------------------------------------------
+    instrumentor.uninstrument()  # second uninstrument must not raise
 
 
 def test_uninstrument_drains_open_spans(span_exporter, tracer_provider):
-    """A span left open at uninstrument time must still be ended (exported),
-    not stranded because the handler was detached before it closed."""
     from llama_index.core.instrumentation import get_dispatcher
 
     instrumentor = LlamaIndexInstrumentor()
     instrumentor.instrument(
         tracer_provider=tracer_provider, skip_dep_check=True
     )
-
     dispatcher = get_dispatcher()
-    # Manually open a span through the dispatcher and DO NOT close it.
+    # Open a real agent span through the dispatcher and never close it.
     dispatcher.span_enter(
-        id_="ManualThing.run-abc", bound_args=None, instance=None
+        id_="ReActAgent.run-drain-probe", bound_args=None, instance=None
     )
-    assert span_exporter.get_finished_spans() == (), "span ended too early"
+    assert span_exporter.get_finished_spans() == ()
 
-    # Uninstrument while that span is still open: it must be drained (ended).
     instrumentor.uninstrument()
     ended = span_exporter.get_finished_spans()
-    assert any(s.name == "ManualThing.run" for s in ended), (
-        f"open span was stranded, not drained: {[s.name for s in ended]}"
+    agent_spans = [
+        s
+        for s in ended
+        if s.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_AGENT
+    ]
+    assert len(agent_spans) == 1, [s.name for s in ended]
+    assert agent_spans[0].name.startswith("invoke_agent")
+
+
+# ---------------------------------------------------------------------------
+# Content capture modes (all owned by the shared handler)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["NO_CONTENT", "SPAN_ONLY", "EVENT_ONLY", "SPAN_AND_EVENT"],
+)
+def test_capture_modes_for_llm_chat(
+    instrument, span_exporter, log_exporter, monkeypatch, mode
+):
+    monkeypatch.setenv(CAPTURE_ENVVAR, mode)
+    _chat_once(_mock_llm())
+
+    llm_span = next(
+        s
+        for s in span_exporter.get_finished_spans()
+        if s.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_LLM
+        and s.attributes.get(_GEN_AI_OPERATION_NAME) == "chat"
+        and s.parent is None
     )
+    events = [
+        record
+        for record in log_exporter.get_finished_logs()
+        if record.log_record.event_name
+        == "gen_ai.client.inference.operation.details"
+    ]
+
+    content_on_span = INPUT_MESSAGES_KEY in llm_span.attributes
+    content_on_event = any(
+        INPUT_MESSAGES_KEY in (record.log_record.attributes or {})
+        for record in events
+    )
+
+    if mode == "NO_CONTENT":
+        assert not content_on_span
+        assert not events
+    elif mode == "SPAN_ONLY":
+        assert content_on_span
+        assert not content_on_event
+    elif mode == "EVENT_ONLY":
+        assert not content_on_span
+        assert content_on_event
+    else:  # SPAN_AND_EVENT
+        assert content_on_span
+        assert content_on_event
+
+    # Structural span exists under every mode.
+    assert llm_span.attributes.get(_GEN_AI_FRAMEWORK) == "llama_index"
+
+
+@pytest.mark.asyncio
+async def test_event_only_agent_run_emits_agent_event_without_span_content(
+    instrument, span_exporter, log_exporter, monkeypatch
+):
+    monkeypatch.setenv(CAPTURE_ENVVAR, "EVENT_ONLY")
+    await _run_react_agent()
+
+    agent_span = next(
+        s
+        for s in span_exporter.get_finished_spans()
+        if s.attributes.get(_GEN_AI_SPAN_KIND) == _SPAN_KIND_AGENT
+    )
+    assert INPUT_MESSAGES_KEY not in agent_span.attributes
+    assert OUTPUT_MESSAGES_KEY not in agent_span.attributes
+
+    agent_events = [
+        record
+        for record in log_exporter.get_finished_logs()
+        if record.log_record.event_name
+        == "gen_ai.client.agent.invoke.operation.details"
+    ]
+    assert agent_events, [
+        r.log_record.event_name for r in log_exporter.get_finished_logs()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Fail-safe: telemetry faults never break the business flow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_failure_does_not_block_agent_run(
+    instrument, span_exporter, monkeypatch
+):
+    handler = instrument._genai_handler
+
+    def boom_start(invocation, context=None):
+        raise RuntimeError("telemetry start exploded")
+
+    monkeypatch.setattr(handler, "start_invoke_agent", boom_start)
+
+    response = await _run_react_agent()
+    # Business result unchanged.
+    assert "sunny in SF" in str(response)
+    # No agent span could start; the run still completed.
+    grouped = _spans_by_kind(span_exporter)
+    assert grouped.get(_SPAN_KIND_AGENT, []) == []
+
+
+@pytest.mark.asyncio
+async def test_stop_failure_does_not_block_agent_run_or_strand_span(
+    instrument, span_exporter, monkeypatch
+):
+    handler = instrument._genai_handler
+
+    def boom_stop(invocation):
+        # Simulate a failure deep in attribute serialization.
+        invocation.span.set_attribute("gen_ai.boom", "x")
+        raise RuntimeError("telemetry stop exploded")
+
+    monkeypatch.setattr(handler, "stop_invoke_agent", boom_stop)
+
+    response = await _run_react_agent()
+    assert "sunny in SF" in str(response)
+
+    # The fail-safe fallback still detaches and ends the agent span even
+    # though stop_invoke_agent raised. Under a set_attribute fault the handler
+    # could not write gen_ai.span.kind, so identify the span by its name.
+    ended = span_exporter.get_finished_spans()
+    agent_spans = [s for s in ended if s.name.startswith("invoke_agent")]
+    assert len(agent_spans) == 1, [s.name for s in ended]
+
+
+@pytest.mark.asyncio
+async def test_set_attribute_failure_never_blocks_agent_run(
+    instrument, span_exporter, monkeypatch
+):
+    from opentelemetry.sdk.trace import _Span as SdkSpan
+
+    real_set_attribute = SdkSpan.set_attribute
+
+    def raising_set_attribute(self, key, value):  # noqa: ANN001
+        if str(key).startswith("gen_ai."):
+            raise RuntimeError("set_attribute exploded")
+        return real_set_attribute(self, key, value)
+
+    monkeypatch.setattr(SdkSpan, "set_attribute", raising_set_attribute)
+
+    response = await _run_react_agent()
+    assert "sunny in SF" in str(response)
+    # The run produced its full span tree despite every gen_ai setattr
+    # failing (spans are identified by name because the fault prevents the
+    # handler from writing gen_ai.span.kind).
+    ended = span_exporter.get_finished_spans()
+    assert len([s for s in ended if s.name.startswith("invoke_agent")]) == 1
+    assert len([s for s in ended if s.name.startswith("execute_tool")]) == 1
+
+
+@pytest.mark.asyncio
+async def test_business_exception_propagates_unchanged_through_failing_telemetry(
+    instrument, span_exporter, monkeypatch
+):
+    from llama_index.core.agent import ReActAgent
+    from llama_index.core.tools import FunctionTool
+
+    handler = instrument._genai_handler
+
+    def boom_fail(invocation, error):  # noqa: ANN001
+        raise RuntimeError("telemetry fail exploded")
+
+    monkeypatch.setattr(handler, "fail_invoke_agent", boom_fail)
+
+    def get_weather(city: str) -> str:
+        """Useful for getting the weather for a city."""
+        return f"sunny in {city}"
+
+    agent = ReActAgent(
+        tools=[FunctionTool.from_defaults(fn=get_weather)],
+        llm=_make_react_llm(boom=True),
+    )
+
+    # The *business* ValueError/message must be the one raised, never replaced
+    # by the telemetry RuntimeError.
+    with pytest.raises(ValueError, match="business boom"):
+        await agent.run("weather?")
+
+
+# ---------------------------------------------------------------------------
+# Runtime dependency declaration
+# ---------------------------------------------------------------------------
+
+
+def test_opentelemetry_util_genai_is_runtime_dependency():
+    requirements = requires("loongsuite-instrumentation-llama-index")
+    assert requirements is not None
+    assert any(
+        req.split()[0] == "opentelemetry-util-genai" for req in requirements
+    ), requirements

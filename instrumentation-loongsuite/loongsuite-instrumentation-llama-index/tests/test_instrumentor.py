@@ -570,6 +570,61 @@ async def test_business_exception_propagates_unchanged_through_failing_telemetry
 # ---------------------------------------------------------------------------
 
 
+def test_chat_end_without_response_does_not_report_request_as_output():
+    """A LLMChatEndEvent whose optional response is absent must leave output
+    unset; the event's ``messages`` are request messages, not generated output.
+    Predict/structured-predict end events instead carry the result in ``output``.
+    """
+    from llama_index.core.llms import ChatMessage
+    from llama_index.core.instrumentation.events.llm import (
+        LLMChatEndEvent,
+        LLMPredictEndEvent,
+    )
+    from opentelemetry.util.genai.extended_handler import ExtendedTelemetryHandler
+    from opentelemetry.util.genai.types import LLMInvocation
+    from opentelemetry.instrumentation.llama_index import _build_event_handler, _build_span_handler
+
+    span_handler = _build_span_handler(ExtendedTelemetryHandler())
+    handler = _build_event_handler(span_handler)
+
+    class _Rec:
+        def __init__(self, invocation):
+            self.kind = "llm"
+            self.invocation = invocation
+
+    # 1) chat end, no response: request messages must not become output.
+    chat_inv = LLMInvocation(provider="llama_index")
+    span_handler._ls_records["chat"] = _Rec(chat_inv)
+    # LLMChatEndEvent requires the response field; None means the optional
+    # generated response is absent (messages here are still request messages).
+    handler._handle_llm(
+        chat_inv,
+        "LLMChatEndEvent",
+        LLMChatEndEvent(
+            messages=[ChatMessage(role="user", content="the prompt")],
+            response=None,
+        ),
+    )
+    assert chat_inv.output_messages == []
+
+    # 2) predict end: the event carries the generated string in ``output``;
+    # the handler routes it through _enrich_llm_response which turns a bare
+    # string response into an output message.
+    pred_inv = LLMInvocation(provider="llama_index")
+    span_handler._ls_records["pred"] = _Rec(pred_inv)
+    handler._handle_llm(
+        pred_inv,
+        "LLMPredictEndEvent",
+        LLMPredictEndEvent(output="predicted"),
+    )
+    flat = [
+        part.content
+        for msg in pred_inv.output_messages
+        for part in getattr(msg, "parts", [])
+    ]
+    assert flat == ["predicted"], flat
+
+
 def test_opentelemetry_util_genai_is_runtime_dependency():
     requirements = requires("loongsuite-instrumentation-llama-index")
     assert requirements is not None

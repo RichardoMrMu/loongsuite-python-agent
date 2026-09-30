@@ -238,6 +238,32 @@ def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return None
 
 
+def _release_span(invocation: Any) -> None:
+    """Best-effort detach/end for an invocation that owns an open span.
+
+    Used when a ``start_*`` raised after the shared handler had already
+    created the span and attached its context, and as the fallback when a
+    ``stop_*``/``fail_*`` raised. Either way the handler-owned span must not
+    stay open and the ambient context must be restored, so a telemetry fault
+    cannot corrupt the caller's trace. Everything is guarded because the
+    invocation may be only partially initialized.
+    """
+    token = getattr(invocation, "context_token", None)
+    if token is not None:
+        try:
+            context_api.detach(token)
+        except Exception:  # noqa: BLE001
+            pass
+        invocation.context_token = None
+    span = getattr(invocation, "span", None)
+    if span is not None:
+        try:
+            if span.is_recording():
+                span.end()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
@@ -774,8 +800,13 @@ def _build_span_handler(genai_handler: Any):
                     context=parent_ctx,
                 )
                 if started is None:
-                    # start_* raised: create no record so exit/drop are no-ops
-                    # and the business call proceeds completely untouched.
+                    # start_* raised: it may already have created the span and
+                    # attached its context before failing, so release whatever
+                    # it created (context restored, no span left open) before
+                    # dropping the invocation. No record is published, so
+                    # exit/drop stay no-ops and the business call proceeds
+                    # completely untouched.
+                    _release_span(invocation)
                     return None
 
                 self._records_map()[id_] = record
@@ -837,20 +868,7 @@ def _build_span_handler(genai_handler: Any):
                 method(invocation, *args)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Telemetry finalize failed: %s", exc)
-                token = getattr(invocation, "context_token", None)
-                if token is not None:
-                    try:
-                        context_api.detach(token)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    invocation.context_token = None
-                span = getattr(invocation, "span", None)
-                if span is not None:
-                    try:
-                        if span.is_recording():
-                            span.end()
-                    except Exception:  # noqa: BLE001
-                        pass
+                _release_span(invocation)
 
         def prepare_to_exit_span(
             self,

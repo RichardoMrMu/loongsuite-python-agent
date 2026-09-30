@@ -40,3 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event's request `messages` as `gen_ai.output.messages`; predict and
   structured-predict end events are enriched from their `output` field
   (including a plain-string output) instead.
+- A `start_*` that raised after the shared handler had already created the span
+  and attached its context no longer leaves that span open and the caller's
+  context attached: the partially initialized invocation is released (context
+  restored) before it is dropped.

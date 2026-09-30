@@ -488,6 +488,50 @@ async def test_start_failure_does_not_block_agent_run(
 
 
 @pytest.mark.asyncio
+async def test_start_failure_after_span_created_closes_span_and_restores_context(
+    instrument, span_exporter, monkeypatch
+):
+    """A ``start_*`` that raises *after* creating the span and attaching its
+    context must not strand either.
+
+    ``test_start_failure_does_not_block_agent_run`` covers a ``start_*`` that
+    raises before it does anything. Here the real ``start_llm`` runs -- it
+    creates the span and attaches the invocation's context -- and only then
+    raises, so the handler is left holding a partially initialized invocation.
+    The ambient context must be restored and no span may stay recording.
+    """
+    from opentelemetry import context as context_api
+    from opentelemetry import trace as trace_api
+
+    handler = instrument._genai_handler
+    real_start = handler.start_llm
+    started = []
+
+    def start_then_boom(invocation, context=None):
+        real_start(invocation, context=context)
+        started.append(invocation)
+        raise RuntimeError("telemetry start exploded after span creation")
+
+    monkeypatch.setattr(handler, "start_llm", start_then_boom)
+
+    outer_context = context_api.get_current()
+    outer_span = trace_api.get_current_span()
+
+    _chat_once(_mock_llm())
+
+    # The instrumented chat call must have reached the failing start_llm.
+    assert started, "start_llm was never reached"
+    for invocation in started:
+        # start_llm created the span and attached its context; neither may
+        # outlive a start that raised before the record was published.
+        assert invocation.context_token is None
+        assert invocation.span is None or not invocation.span.is_recording()
+    # The ambient context is restored to exactly what it was before the call.
+    assert context_api.get_current() is outer_context
+    assert trace_api.get_current_span() is outer_span
+
+
+@pytest.mark.asyncio
 async def test_stop_failure_does_not_block_agent_run_or_strand_span(
     instrument, span_exporter, monkeypatch
 ):
@@ -575,14 +619,20 @@ def test_chat_end_without_response_does_not_report_request_as_output():
     unset; the event's ``messages`` are request messages, not generated output.
     Predict/structured-predict end events instead carry the result in ``output``.
     """
-    from llama_index.core.llms import ChatMessage
     from llama_index.core.instrumentation.events.llm import (
         LLMChatEndEvent,
         LLMPredictEndEvent,
     )
-    from opentelemetry.util.genai.extended_handler import ExtendedTelemetryHandler
+    from llama_index.core.llms import ChatMessage
+
+    from opentelemetry.instrumentation.llama_index import (
+        _build_event_handler,
+        _build_span_handler,
+    )
+    from opentelemetry.util.genai.extended_handler import (
+        ExtendedTelemetryHandler,
+    )
     from opentelemetry.util.genai.types import LLMInvocation
-    from opentelemetry.instrumentation.llama_index import _build_event_handler, _build_span_handler
 
     span_handler = _build_span_handler(ExtendedTelemetryHandler())
     handler = _build_event_handler(span_handler)

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Record `gen_ai.client.operation.duration` for every extended GenAI invocation
+  type (embedding, execute tool, create agent, invoke agent, retrieval, rerank,
+  memory, entry and ReAct step), keyed by the invocation's
+  `gen_ai.operation.name`, and `gen_ai.client.token.usage` for the invocation
+  types that carry token counts. These metrics were previously dropped for every
+  non-LLM invocation, while their spans were still emitted.
+
 ## Version 0.9.0 (2026-09-07)
 
 There are no changelog entries for this release.

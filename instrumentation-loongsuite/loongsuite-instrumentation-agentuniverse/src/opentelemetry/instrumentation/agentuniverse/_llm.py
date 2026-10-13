@@ -75,6 +75,96 @@ logger = logging.getLogger(__name__)
 SPAN_KIND_VALUE = "llm"
 
 
+def usage_of(result: Any) -> Optional[TokenUsage]:
+    """The token usage a call reported, from the result or from its raw payload.
+
+    The framework's LLM implementations fill ``LLMOutput.usage`` through
+    ``TokenUsage.from_openai``/``from_anthropic``, but a call that only carries
+    the provider payload in ``LLMOutput.raw`` -- which is what an OpenAI-style
+    service reporting usage outside the standard field looks like -- would
+    otherwise appear to have spent no tokens at all, leaving both the
+    ``au.*.usage.*`` attributes and the shared handler's ``gen_ai.usage.*``
+    empty. The payload is converted with the framework's own converters, so the
+    numbers agree with the framework instead of being re-derived here.
+    """
+    usage = getattr(result, "usage", None)
+    if usage:
+        return usage
+    raw = getattr(result, "raw", None)
+    payload = raw.get("usage") if isinstance(raw, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    for convert in (TokenUsage.from_openai, TokenUsage.from_anthropic):
+        derived = convert(payload)
+        if derived.total_tokens:
+            return derived
+    return None
+
+
+def chunk_text(chunk: Any) -> str:
+    """The text one streamed chunk contributes to the LLM span's output.
+
+    A chunk that carries a ``text`` field is the framework's own payload, and an
+    empty string is a real value there: a role-only or usage-only chunk carries
+    ``text=""`` and must contribute nothing rather than its repr. A chunk
+    without a ``text`` field is not a framework payload and is rendered as it
+    is.
+    """
+    text = getattr(chunk, "text", None)
+    if isinstance(text, str):
+        return text
+    if hasattr(chunk, "text"):
+        return ""
+    return str(chunk)
+
+
+class ClaimedAsyncStream:
+    """The async twin of ``process_sync_stream``: claimed, then finalized once.
+
+    ``process_async_stream`` cannot itself be an async generator, because an
+    async generator's body -- ``mark_streaming()`` included -- only runs on the
+    caller's first ``__anext__``. A stream that is awaited and then closed or
+    dropped without being read would therefore keep the caller's context token
+    attached and its span recording. This iterator claims the stream when it is
+    created, so the caller's context is released before it resumes, and it
+    finalizes the span as soon as consumption stops, however it stops.
+    """
+
+    def __init__(
+        self, call: "_LLMCall", stream: AsyncGenerator[Any, None]
+    ) -> None:
+        self._call = call
+        self._stream = stream
+        self._started = False
+
+    def __aiter__(self) -> "ClaimedAsyncStream":
+        return self
+
+    def __anext__(self) -> Any:
+        self._started = True
+        return self._stream.__anext__()
+
+    def asend(self, value: Any) -> Any:
+        self._started = True
+        return self._stream.asend(value)
+
+    def athrow(self, *args: Any, **kwargs: Any) -> Any:
+        self._started = True
+        return self._stream.athrow(*args, **kwargs)
+
+    async def aclose(self) -> None:
+        """Stop the stream early; the span closes exactly once."""
+        try:
+            await self._stream.aclose()
+        finally:
+            if not self._started:
+                # Nothing was read, so ``_async_stream`` never ran and its own
+                # finalizer never fired. Close the span with the empty output
+                # the caller actually got, like the sync twin does.
+                run_safely(self._call.finish_stream_success, "", None)
+            run_safely(self._call.finalize)
+
+
 def _apply_llm_plugins(func: Any) -> Any:
     """Apply the framework's LLM plugin hook, resolved per call.
 
@@ -288,7 +378,7 @@ class _LLMCall:
         span = self.layer_span.span
         span.set_attribute(LLMAttributes.STREAMING, False)
         duration = self.layer_span.elapsed()
-        usage = getattr(result, "usage", None)
+        usage = usage_of(result)
 
         run_safely(
             Monitor.trace_llm_invocation,
@@ -453,10 +543,8 @@ class _LLMCall:
                 if first:
                     first = False
                     run_safely(self._finish_first_token)
-                output.append(
-                    chunk.text if hasattr(chunk, "text") else str(chunk)
-                )
-                chunk_usage = getattr(chunk, "usage", None)
+                output.append(chunk_text(chunk))
+                chunk_usage = usage_of(chunk)
                 if chunk_usage:
                     usage = chunk_usage
                 yield chunk
@@ -473,12 +561,15 @@ class _LLMCall:
                 run_safely(self.finish_stream_success, "".join(output), usage)
             run_safely(self.finalize, error)
 
-    async def process_async_stream(
-        self, result: Any
-    ) -> AsyncGenerator[Any, None]:
+    def process_async_stream(self, result: Any) -> ClaimedAsyncStream:
+        """Claim the stream before the caller gets it, like the sync twin.
+
+        ``mark_streaming`` releases the caller's context token, so it has to run
+        now rather than on the caller's first iteration; the returned iterator
+        finalizes the span whenever consumption stops.
+        """
         self.mark_streaming()
-        async for chunk in self._async_stream(result):
-            yield chunk
+        return ClaimedAsyncStream(self, self._async_stream(result))
 
     async def _async_stream(self, result: Any) -> AsyncGenerator[Any, None]:
         output: list[str] = []
@@ -490,8 +581,8 @@ class _LLMCall:
                 if first:
                     first = False
                     run_safely(self._finish_first_token)
-                output.append(getattr(chunk, "text", None) or str(chunk))
-                chunk_usage = getattr(chunk, "usage", None)
+                output.append(chunk_text(chunk))
+                chunk_usage = usage_of(chunk)
                 if chunk_usage:
                     usage = chunk_usage
                 yield chunk

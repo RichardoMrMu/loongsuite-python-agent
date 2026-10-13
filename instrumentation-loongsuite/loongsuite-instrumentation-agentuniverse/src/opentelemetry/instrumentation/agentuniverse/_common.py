@@ -326,10 +326,19 @@ class LayerSpan:
         self.context_token = otel_context.attach(
             trace.set_span_in_context(self.span)
         )
-        # The framework's token bookkeeping is keyed by the span that is current
-        # when a layer starts, so seed it right after attaching.
-        reset_token_usage(self.span.context.span_id)
-        self.mark_gen_ai_identity()
+        try:
+            # The framework's token bookkeeping is keyed by the span that is
+            # current when a layer starts, so seed it right after attaching.
+            reset_token_usage(self.span.context.span_id)
+            self.mark_gen_ai_identity()
+        except BaseException:
+            # A half-attached span is worse than no span: the context token
+            # would stay attached and the span open, so every later span of
+            # this trace would be filed under a span that never finished.
+            # Undo both, then let the caller run the call uninstrumented.
+            self.detach()
+            self.end()
+            raise
         return self
 
     def take_context_token(self) -> Any:

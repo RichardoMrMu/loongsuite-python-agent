@@ -50,7 +50,6 @@ from ._common import (
     agent_name_attributes,
     build_safely,
     caller_labels,
-    detach_context_token,
     error_status_text,
     input_messages_for,
     llm_params_attribute,
@@ -293,11 +292,24 @@ class _LLMCall:
         #: Only a node this call actually added may be popped again.
         self.invocation_chain_pushed = False
         self.invocation = LLMInvocation(
-            request_model=self.source,
+            request_model=self._request_model(),
             provider=self.channel_name or None,
             attributes=agent_name_attributes(),
             temperature=self._temperature(),
         )
+
+    def _request_model(self) -> Optional[str]:
+        """The model the call asks for, for ``gen_ai.request.model``.
+
+        The framework's ``LLM.model_name`` carries the provider model (``gpt-4``
+        and friends); a component that does not configure one reports its own
+        name, which is what the framework's instrumentation uses as well.
+        ``au.llm.name`` keeps that component name in either case.
+        """
+        model_name = getattr(self.llm_instance, "model_name", None)
+        if isinstance(model_name, str) and model_name:
+            return model_name
+        return self.source
 
     def _temperature(self) -> Optional[float]:
         """The configured temperature, ignoring the framework's -1 sentinel."""
@@ -507,25 +519,16 @@ class _LLMCall:
                 self.invocation,
                 Error(message=error_status_text(error), type=type(error)),
             )
-        self._release_context_token(layer_span)
-        layer_span.end()
+        # Everything left over is closed by the handler's own cleanup rather
+        # than by hand: ``abandon_llm`` detaches whatever token is still pending
+        # and ends the span if it is still recording, and it is a no-op on an
+        # invocation ``stop_llm``/``fail_llm`` already finalized. The plugin
+        # therefore hands the token over before finalizing and owns neither
+        # step afterwards.
+        run_safely(self._layer.handler.abandon_llm, self.invocation)
         if self.invocation_chain_pushed:
             self.invocation_chain_pushed = False
             pop_invocation_chain()
-
-    def _release_context_token(self, layer_span: LayerSpan) -> None:
-        """Detach the span context unless the handler already did.
-
-        The shared handler detaches the token and ends the span itself whenever
-        it finalizes an invocation; detaching it a second time would raise. A
-        streaming call has already handed its token over before this point.
-        """
-        if not layer_span.span.is_recording():
-            self.invocation.context_token = None
-        leftover = self.invocation.context_token
-        if leftover is not None:
-            self.invocation.context_token = None
-            run_safely(detach_context_token, leftover)
 
     # -- streaming ----------------------------------------------------
 

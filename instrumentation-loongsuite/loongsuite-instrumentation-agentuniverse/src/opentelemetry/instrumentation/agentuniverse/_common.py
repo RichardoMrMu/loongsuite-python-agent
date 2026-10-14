@@ -54,6 +54,7 @@ from opentelemetry.util.genai.types import (
     InputMessage,
     OutputMessage,
     Text,
+    ToolCall,
 )
 from opentelemetry.util.genai.utils import (
     ContentCapturingMode,
@@ -598,11 +599,113 @@ def input_messages_for(payload: Any) -> list:
     return [user_message(text)] if text else []
 
 
-def output_messages_for(payload: Any, finish_reason: str = "stop") -> list:
-    if payload is None:
+def parse_tool_arguments(value: Any) -> Any:
+    """Parse the framework's JSON tool arguments for a GenAI tool call.
+
+    The framework carries tool arguments as the provider's JSON string. The
+    shared GenAI type holds them parsed, so a string that is valid JSON becomes
+    the object it encodes and anything else is passed through unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return value
+    return parsed if isinstance(parsed, dict) else value
+
+
+def tool_call_function(call: Any) -> Any:
+    """The ``FunctionCall`` of a framework tool call, when it has one.
+
+    The framework's own ``ToolCall`` keeps the name and the JSON arguments one
+    level down, in ``function`` (``{"id": ..., "type": "function",
+    "function": {"name": ..., "arguments": ...}}``), which is also the shape the
+    provider sends.
+    """
+    if isinstance(call, dict):
+        return call.get("function")
+    return getattr(call, "function", None)
+
+
+def tool_call_field(call: Any, name: str) -> Any:
+    """One field of a tool call, wherever its shape keeps it."""
+    function = tool_call_function(call)
+    if function is not None:
+        value = (
+            function.get(name)
+            if isinstance(function, dict)
+            else getattr(function, name, None)
+        )
+        if value is not None:
+            return value
+    if isinstance(call, dict):
+        return call.get(name)
+    return getattr(call, name, None)
+
+
+def tool_call_parts(payload: Any) -> list:
+    """Map the framework's tool calls onto the shared GenAI tool-call parts."""
+    if not payload:
         return []
-    text = payload if isinstance(payload, str) else safe_json_dumps(payload)
-    return [assistant_message(text, finish_reason)] if text else []
+    parts = []
+    for call in payload:
+        parts.append(
+            ToolCall(
+                arguments=parse_tool_arguments(
+                    tool_call_field(call, "arguments")
+                ),
+                name=str(tool_call_field(call, "name") or ""),
+                id=tool_call_field(call, "id"),
+            )
+        )
+    return parts
+
+
+def output_messages_for(
+    payload: Any, finish_reason: str = "stop", tool_calls: Any = None
+) -> list:
+    """The assistant message a layer reports for its own output.
+
+    A round that answers with tool calls has no text: the calls themselves are
+    the output, so ``tool_calls`` becomes a tool-call part of the same message.
+    """
+    parts: list = []
+    if payload is not None:
+        text = (
+            payload if isinstance(payload, str) else safe_json_dumps(payload)
+        )
+        if text:
+            parts.append(Text(content=text))
+    parts.extend(tool_call_parts(tool_calls))
+    if not parts:
+        return []
+    return [
+        OutputMessage(
+            role="assistant", parts=parts, finish_reason=finish_reason
+        )
+    ]
+
+
+def final_answer_of(result: Any) -> Any:
+    """The agent's final answer, without the framework's own call envelope.
+
+    ``AgentTemplate.customized_execute`` returns the caller's whole agent input
+    with the answer under ``output``. Only that answer is the agent's output;
+    echoing the input back would publish the prompt and the framework's
+    bookkeeping as the agent's output.
+    """
+    if isinstance(result, dict):
+        return result.get("output")
+    getter = getattr(result, "get_data", None)
+    if callable(getter):
+        answer = run_safely(getter, "output")
+        if answer is not None:
+            return answer
+    return getattr(result, "output", result)
 
 
 _current_agent_name: ContextVar[Optional[str]] = ContextVar(

@@ -56,6 +56,11 @@ from ._common import (
     describe_wrapper_owner,
 )
 from ._llm import LLMLayer
+from ._step import (
+    ReactStepLayer,
+    install_react_step_hooks,
+    remove_react_step_hooks,
+)
 from ._tool import ToolLayer
 from .version import __version__
 
@@ -78,6 +83,7 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
 
     _snapshot: Dict[str, Any] = {}
     _wrappers: Dict[str, Any] = {}
+    _hooks: Dict[str, Any] = {}
     _owns_install = False
     #: Set when ``_instrument`` rolled back, so ``instrument`` can undo the
     #: instrumented mark ``BaseInstrumentor`` applies after it returns.
@@ -133,7 +139,8 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
                 tracer_provider=tracer_provider,
                 meter_provider=meter_provider,
             )
-            agent_layer = AgentLayer(tracer, handler, meter)
+            step_layer = ReactStepLayer(handler)
+            agent_layer = AgentLayer(tracer, handler, meter, step_layer)
             llm_layer = LLMLayer(tracer, handler, meter)
             tool_layer = ToolLayer(tracer, handler, meter)
             wrappers: Dict[str, Any] = {
@@ -168,8 +175,22 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
             self._install_failed = True
             return
 
+        # The ReAct round hooks are the only calls the tool-calling loop makes
+        # around every round, so the STEP spans hang off them. They are patched
+        # after the wrappers are in place and restored with them.
+        hooks = install_react_step_hooks(step_layer)
+        if not hooks:
+            self._rollback(snapshot, wrappers, installed)
+            logger.warning(
+                "Installing the LoongSuite agentUniverse round hooks failed; "
+                "rolled back to the original wrappers",
+            )
+            self._install_failed = True
+            return
+
         self._snapshot = snapshot
         self._wrappers = wrappers
+        self._hooks = hooks
         self._owns_install = True
         _install_state.owner = self
 
@@ -272,6 +293,9 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
         self._owns_install = False
         self._snapshot = {}
         self._wrappers = {}
+        hooks, self._hooks = self._hooks, {}
+        if hooks:
+            remove_react_step_hooks(hooks)
 
     # -- introspection (used by tests and diagnostics) -----------------
 

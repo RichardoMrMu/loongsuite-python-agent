@@ -21,6 +21,7 @@ are compared by type and sign instead of by value; everything else is compared
 literally.
 """
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -51,8 +52,32 @@ def is_dynamic_attribute(key: str) -> bool:
     return any(key.endswith(f".{suffix}") for suffix in DYNAMIC_SUFFIXES)
 
 
+#: ``au.agent.output`` is the one ``au.*`` carrier with an intentional
+#: difference: the framework's own instrumentation publishes whatever
+#: ``customized_execute`` returned -- the caller's whole agent input with the
+#: answer under ``output`` -- while this package publishes the answer itself (see
+#: the README). Comparing the two means comparing the answers.
+AGENT_OUTPUT_ATTRIBUTE = "au.agent.output"
+_ENVELOPE_ANSWER_KEY = "output"
+
+
+def agent_answer(value: Any) -> Any:
+    """The agent's answer inside an ``au.agent.output`` carrier value."""
+    if not isinstance(value, str):
+        return value
+    try:
+        decoded = json.loads(value)
+    except Exception:
+        return value
+    if isinstance(decoded, dict) and _ENVELOPE_ANSWER_KEY in decoded:
+        return decoded[_ENVELOPE_ANSWER_KEY]
+    return decoded
+
+
 def normalise_attribute_value(key: str, value: Any) -> Any:
     """Reduce one attribute to the part two runs can be expected to share."""
+    if key == AGENT_OUTPUT_ATTRIBUTE:
+        return agent_answer(value)
     if not is_dynamic_attribute(key):
         if (
             isinstance(value, str)
@@ -67,6 +92,27 @@ def normalise_attribute_value(key: str, value: Any) -> Any:
     if isinstance(value, str):
         return "non-empty-string" if value else "empty-string"
     return f"type:{type(value).__name__}"
+
+
+def framework_version() -> tuple:
+    """The installed agentUniverse version, as comparable numbers."""
+    from importlib.metadata import version
+
+    text = version("agentuniverse")
+    return tuple(int(part) for part in re.findall(r"\d+", text)[:3])
+
+
+def native_stream_usage_doubling() -> bool:
+    """Whether the framework's own instrumentation doubles streamed usage.
+
+    0.0.19.1 counts a streamed response onto its parent twice: its stream loop
+    calls ``add_current_token_usage`` and its ``_finalize_streaming_result``
+    calls it again for the same usage. From 0.1.0a2 on that second call is gone
+    (the source says so in a comment: it would double count). The tests assert
+    the value this build of the framework actually produces instead of assuming
+    one of the two behaviours.
+    """
+    return framework_version() < (0, 1, 0)
 
 
 @dataclass(frozen=True)

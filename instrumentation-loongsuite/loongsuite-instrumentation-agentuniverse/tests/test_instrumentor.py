@@ -556,10 +556,7 @@ class TestAgentLayer:
         assert json.loads(record.au["au.agent.input"]) == {
             "kwargs": {"input": "hello"}
         }
-        assert "echo:hello" in record.au["au.agent.output"]
-        assert (
-            json.loads(record.au["au.agent.output"])["output"] == "echo:hello"
-        )
+        assert json.loads(record.au["au.agent.output"]) == "echo:hello"
 
     def test_span_carries_gen_ai_attributes(
         self, loongsuite_harness: Any
@@ -1414,9 +1411,15 @@ class TestBaselineMatrix:
         native = baseline.find(result.native_records, "au.agent.stream_agent")
         ours = baseline.find(result.ours_records, "au.agent.stream_agent")
         assert ours.au["au.agent.usage.total_tokens"] == 10
-        assert native.au["au.agent.usage.total_tokens"] == 20, (
+        # The framework counts a streamed response onto its parent twice in
+        # 0.0.19.1 and once from 0.1.0a2 on, so the value asserted here follows
+        # the installed build instead of assuming either behaviour.
+        expected_native = 20 if baseline.native_stream_usage_doubling() else 10
+        assert native.au["au.agent.usage.total_tokens"] == expected_native, (
             "the framework's own instrumentation is expected to count a "
-            "streamed response onto its parent twice"
+            "streamed response onto its parent once or twice, depending on "
+            "its release; got "
+            f"{native.au['au.agent.usage.total_tokens']}"
         )
 
 

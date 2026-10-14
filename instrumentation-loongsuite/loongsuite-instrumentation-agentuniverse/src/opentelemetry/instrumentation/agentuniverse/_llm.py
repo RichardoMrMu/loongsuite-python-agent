@@ -74,6 +74,23 @@ logger = logging.getLogger(__name__)
 SPAN_KIND_VALUE = "llm"
 
 
+def raw_usage_converter() -> Optional[Any]:
+    """The framework converter that can read a raw provider payload.
+
+    ``TokenUsage.from_anthropic`` only exists from 0.1.0a2 on, and the stable
+    releases are the ones the support matrix is built around, so the converter is
+    looked up one name at a time: an attribute that is not there must never be
+    read. ``from_openai`` stays the first choice because the payload is an
+    OpenAI-shaped one whenever both converters would accept it, which is the
+    order the framework's own LLM implementations use.
+    """
+    for name in ("from_openai", "from_anthropic"):
+        convert = getattr(TokenUsage, name, None)
+        if callable(convert):
+            return convert
+    return None
+
+
 def usage_of(result: Any) -> Optional[TokenUsage]:
     """The token usage a call reported, from the result or from its raw payload.
 
@@ -93,28 +110,114 @@ def usage_of(result: Any) -> Optional[TokenUsage]:
     payload = raw.get("usage") if isinstance(raw, dict) else None
     if not isinstance(payload, dict):
         return None
-    for convert in (TokenUsage.from_openai, TokenUsage.from_anthropic):
-        derived = convert(payload)
-        if derived.total_tokens:
-            return derived
-    return None
+    convert = raw_usage_converter()
+    if convert is None:  # pragma: no cover - a framework without converters
+        return None
+    derived = convert(payload)
+    return derived if derived.total_tokens else None
+
+
+def chunk_record(chunk: Any) -> tuple:
+    """One streamed chunk as ``(text, usage)``, from either framework shape.
+
+    A chunk of the stable ``LLMOutput`` shape carries its text in ``text``, and
+    an empty string there is a real value: a role-only or usage-only chunk
+    contributes nothing rather than its repr. From 0.1.0a2 on a streamed chunk --
+    or the ``LLMStreamEvent`` wrapper around it -- carries the delta in
+    ``text_delta`` instead, and ``LLMStreamEvent.text`` is a class method rather
+    than the payload, so a reader that only knows ``text`` drops the whole
+    stream's output. A chunk with neither field is not a framework payload and is
+    rendered as it is.
+    """
+    text = ""
+    for name in ("text", "text_delta"):
+        value = getattr(chunk, name, None)
+        if isinstance(value, str):
+            text = value
+            break
+    else:
+        if not hasattr(chunk, "text") and not hasattr(chunk, "text_delta"):
+            text = str(chunk)
+    return text, getattr(chunk, "usage", None)
 
 
 def chunk_text(chunk: Any) -> str:
-    """The text one streamed chunk contributes to the LLM span's output.
+    """The text one streamed chunk contributes to the LLM span's output."""
+    return chunk_record(chunk)[0]
 
-    A chunk that carries a ``text`` field is the framework's own payload, and an
-    empty string is a real value there: a role-only or usage-only chunk carries
-    ``text=""`` and must contribute nothing rather than its repr. A chunk
-    without a ``text`` field is not a framework payload and is rendered as it
-    is.
+
+def tool_calls_of(result: Any) -> list:
+    """The tool calls an LLM result asked for, from either framework shape.
+
+    ``LLMOutput.get_tool_calls()`` is the 0.1.0a2 accessor; the stable shape
+    keeps the provider message in ``LLMOutput.message``. A plain answer has
+    neither and reports no calls.
     """
-    text = getattr(chunk, "text", None)
-    if isinstance(text, str):
-        return text
-    if hasattr(chunk, "text"):
-        return ""
-    return str(chunk)
+    getter = getattr(result, "get_tool_calls", None)
+    if callable(getter):
+        calls = run_safely(getter)
+        if calls:
+            return list(calls)
+    calls = getattr(result, "tool_calls", None)
+    if calls:
+        return list(calls)
+    message = getattr(result, "message", None)
+    if isinstance(message, dict) and message.get("tool_calls"):
+        return list(message["tool_calls"])
+    return []
+
+
+def _streamed_tool_call_deltas(chunk: Any) -> list:
+    """The tool-call deltas one streamed chunk carries, if any."""
+    delta = getattr(chunk, "tool_call_delta", None)
+    if delta is not None:
+        return [delta]
+    deltas = getattr(chunk, "tool_calls", None)
+    if deltas:
+        return list(deltas)
+    message = getattr(chunk, "message", None)
+    if isinstance(message, dict) and message.get("tool_calls"):
+        return list(message["tool_calls"])
+    return []
+
+
+class ToolCallAccumulator:
+    """Assembles the tool calls a stream spreads across its chunks.
+
+    A streamed tool call arrives in fragments: the first delta carries the id
+    and the name, every later one carries another slice of the JSON arguments.
+    The calls are kept in the order of their indices, which is the order the
+    provider numbered them.
+    """
+
+    def __init__(self) -> None:
+        self._calls: Dict[int, Dict[str, Any]] = {}
+
+    def feed(self, chunk: Any) -> None:
+        for position, delta in enumerate(_streamed_tool_call_deltas(chunk)):
+            index = getattr(delta, "index", None)
+            identifier = getattr(delta, "id", None)
+            name = getattr(delta, "name", None)
+            fragment = getattr(delta, "arguments_delta", None)
+            if isinstance(delta, dict):
+                index = delta.get("index", index)
+                identifier = delta.get("id", identifier)
+                name = delta.get("name", name)
+                fragment = delta.get("arguments_delta", fragment)
+            if not isinstance(index, int):
+                index = len(self._calls) if index is None else position
+            call = self._calls.setdefault(
+                index, {"id": None, "name": "", "arguments": ""}
+            )
+            if identifier:
+                call["id"] = identifier
+            if name:
+                call["name"] = name
+            if isinstance(fragment, str):
+                call["arguments"] += fragment
+
+    def result(self) -> list:
+        return [self._calls[index] for index in sorted(self._calls)]
 
 
 class ClaimedAsyncStream:
@@ -272,6 +375,10 @@ class _LLMCall:
         kwargs: Dict[str, Any],
     ) -> None:
         self._layer = layer
+        #: Kept because the per-call overrides are read from the call's own
+        #: arguments: ``_get_llm_info`` only reports what the component is
+        #: configured with.
+        self.kwargs = dict(kwargs or {})
         (
             self.llm_instance,
             self.source,
@@ -298,6 +405,23 @@ class _LLMCall:
             temperature=self._temperature(),
         )
 
+    def _call_model_override(self) -> Optional[str]:
+        """The model this one call asks for, when it names one itself.
+
+        Every framework LLM implementation pops ``model`` out of the call's own
+        arguments and falls back to its configured name
+        (``model=kwargs.pop("model", self.model_name)``), so a call that names a
+        model really does go to that model. Telemetry has to report the model the
+        call went to, not the one the component defaults to.
+        """
+        for source in (self.kwargs, self.llm_input):
+            if not isinstance(source, dict):
+                continue
+            value = source.get("model")
+            if isinstance(value, str) and value:
+                return value
+        return None
+
     def _request_model(self) -> Optional[str]:
         """The model the call asks for, for ``gen_ai.request.model``.
 
@@ -306,6 +430,9 @@ class _LLMCall:
         name, which is what the framework's instrumentation uses as well.
         ``au.llm.name`` keeps that component name in either case.
         """
+        override = self._call_model_override()
+        if override:
+            return override
         model_name = getattr(self.llm_instance, "model_name", None)
         if isinstance(model_name, str) and model_name:
             return model_name
@@ -426,13 +553,23 @@ class _LLMCall:
             set_usage_attributes(span, LLMAttributes, usage)
 
         self._set_invocation_success(
-            result.text, usage, getattr(result, "finish_reason", None)
+            result.text,
+            usage,
+            getattr(result, "finish_reason", None),
+            tool_calls_of(result),
         )
 
     def finish_stream_success(
-        self, output: str, usage: Optional[TokenUsage]
+        self,
+        output: str,
+        usage: Optional[TokenUsage],
+        tool_calls: Optional[list] = None,
     ) -> None:
-        """Finalize a consumed stream. Usage reaches the parent once."""
+        """Finalize a consumed stream. Usage reaches the parent once.
+
+        ``tool_calls`` carries the calls a streamed tool-planning round assembled:
+        that round has no text at all, and its calls are its output.
+        """
         if self.layer_span is None:
             return
         span = self.layer_span.span
@@ -465,16 +602,25 @@ class _LLMCall:
         if usage:
             set_usage_attributes(span, LLMAttributes, usage)
 
-        self._set_invocation_success(output, usage)
+        self._set_invocation_success(output, usage, None, tool_calls)
 
     def _set_invocation_success(
         self,
         output: str,
         usage: Optional[TokenUsage],
         finish_reason: Optional[str] = None,
+        tool_calls: Optional[list] = None,
     ) -> None:
-        reason = finish_reason or "stop"
-        self.invocation.output_messages = output_messages_for(output, reason)
+        """Hand the shared handler this call's output, calls included.
+
+        A round that answers with tool calls carries no text; without the calls
+        its ``gen_ai.output.messages`` would be empty even though the round did
+        produce the tool plan.
+        """
+        reason = finish_reason or ("tool_calls" if tool_calls else "stop")
+        self.invocation.output_messages = output_messages_for(
+            output, reason, tool_calls
+        )
         self.invocation.finish_reasons = [reason]
         if usage:
             if usage.prompt_tokens:
@@ -539,6 +685,7 @@ class _LLMCall:
     def _sync_stream(self, result: Any) -> Generator[Any, None, None]:
         output: list[str] = []
         usage: Optional[TokenUsage] = None
+        tool_calls = ToolCallAccumulator()
         error: Optional[BaseException] = None
         first = True
         try:
@@ -546,10 +693,19 @@ class _LLMCall:
                 if first:
                     first = False
                     run_safely(self._finish_first_token)
-                output.append(chunk_text(chunk))
-                chunk_usage = usage_of(chunk)
+                # The chunk is read here, before the caller receives it, so every
+                # read is guarded: a collector that fails must not turn a working
+                # stream into a failing one, and must not disturb the chunk the
+                # caller is waiting for -- it is yielded unchanged and in order.
+                text, chunk_usage = run_safely(chunk_record, chunk) or (
+                    "",
+                    None,
+                )
+                if text:
+                    output.append(text)
                 if chunk_usage:
                     usage = chunk_usage
+                run_safely(tool_calls.feed, chunk)
                 yield chunk
         except GeneratorExit:
             # The caller stopped consuming the stream early: the span still
@@ -561,7 +717,12 @@ class _LLMCall:
             raise
         finally:
             if error is None:
-                run_safely(self.finish_stream_success, "".join(output), usage)
+                run_safely(
+                    self.finish_stream_success,
+                    "".join(output),
+                    usage,
+                    tool_calls.result(),
+                )
             run_safely(self.finalize, error)
 
     def process_async_stream(self, result: Any) -> ClaimedAsyncStream:
@@ -577,6 +738,7 @@ class _LLMCall:
     async def _async_stream(self, result: Any) -> AsyncGenerator[Any, None]:
         output: list[str] = []
         usage: Optional[TokenUsage] = None
+        tool_calls = ToolCallAccumulator()
         error: Optional[BaseException] = None
         first = True
         try:
@@ -584,10 +746,17 @@ class _LLMCall:
                 if first:
                     first = False
                     run_safely(self._finish_first_token)
-                output.append(chunk_text(chunk))
-                chunk_usage = usage_of(chunk)
+                # Same rule as the sync twin: the collector is guarded, and the
+                # chunk the caller awaited is delivered unchanged and in order.
+                text, chunk_usage = run_safely(chunk_record, chunk) or (
+                    "",
+                    None,
+                )
+                if text:
+                    output.append(text)
                 if chunk_usage:
                     usage = chunk_usage
+                run_safely(tool_calls.feed, chunk)
                 yield chunk
         except GeneratorExit:
             # The caller stopped consuming the stream early: the span still
@@ -599,7 +768,12 @@ class _LLMCall:
             raise
         finally:
             if error is None:
-                run_safely(self.finish_stream_success, "".join(output), usage)
+                run_safely(
+                    self.finish_stream_success,
+                    "".join(output),
+                    usage,
+                    tool_calls.result(),
+                )
             run_safely(self.finalize, error)
 
 

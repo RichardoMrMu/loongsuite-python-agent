@@ -53,6 +53,7 @@ from ._common import (
     caller_labels,
     detach_context_token,
     error_status_text,
+    final_answer_of,
     input_messages_for,
     maybe_content,
     monotonic_now,
@@ -68,6 +69,12 @@ from ._common import (
     set_layer_error_attributes,
     set_usage_attributes,
     token_usage_for,
+)
+from ._step import (
+    ReactStepLayer,
+    current_react_step_tracker,
+    pop_react_step_tracker,
+    push_react_step_tracker,
 )
 
 logger = logging.getLogger(__name__)
@@ -252,6 +259,8 @@ class _AgentCall:
         self.finished = False
         #: Only a node this call actually added may be popped again.
         self.invocation_chain_pushed = False
+        #: The ReAct step tracker of this call, pushed while it runs.
+        self.react_step_token = None
 
     # -- lifecycle ----------------------------------------------------
 
@@ -276,6 +285,12 @@ class _AgentCall:
         self.invocation.input_messages = input_messages_for(self.agent_input)
 
         run_safely(self._layer.metrics.record_call, self.labels)
+
+        # The ReAct round hooks run inside this call's context, so the tracker
+        # they read is the one pushed here.
+        self.react_step_token = push_react_step_tracker(
+            self._layer.react_step_tracker()
+        )
 
         kwargs["memory_source_info"] = self.caller_info
         memory = _memory_module()
@@ -328,10 +343,16 @@ class _AgentCall:
 
         span.set_attribute(AgentAttributes.DURATION, duration)
         span.set_attribute(AgentAttributes.STATUS, SUCCESS_STATUS)
-        payload = result.to_dict() if hasattr(result, "to_dict") else result
-        content = maybe_content(payload)
-        if content is not None:
-            span.set_attribute(AgentAttributes.OUTPUT, content)
+        # ``AgentTemplate.customized_execute`` returns the caller's whole agent
+        # input with the answer under ``output``. The agent's output is that
+        # answer alone: publishing the envelope would echo the prompt and the
+        # framework's own bookkeeping as the agent's output.
+        answer = final_answer_of(result)
+        payload = answer.to_dict() if hasattr(answer, "to_dict") else answer
+        if payload is not None:
+            content = maybe_content(payload)
+            if content is not None:
+                span.set_attribute(AgentAttributes.OUTPUT, content)
         set_usage_attributes(span, AgentAttributes, usage)
 
         self.invocation.output_messages = output_messages_for(payload)
@@ -374,6 +395,12 @@ class _AgentCall:
         if self.finished:
             return
         self.finished = True
+        # A round the loop never closed -- an LLM call that raised, an aborted
+        # loop -- still leaves a step span behind, and a step whose span never
+        # ends stays open for the rest of the process. Close it first: it is a
+        # child of this span, so it has to end before the agent span does.
+        run_safely(self._close_open_react_step, error)
+        self._pop_react_step_tracker()
         layer_span = self.layer_span
         if layer_span is None:
             return
@@ -399,6 +426,18 @@ class _AgentCall:
         self._release_context_token(layer_span)
         layer_span.end()
 
+    def _close_open_react_step(
+        self, error: Optional[BaseException] = None
+    ) -> None:
+        """Close the step of the round this call ended in the middle of."""
+        tracker = current_react_step_tracker()
+        if tracker is not None:
+            tracker.close(error)
+
+    def _pop_react_step_tracker(self) -> None:
+        token, self.react_step_token = self.react_step_token, None
+        pop_react_step_tracker(token)
+
     def _release_context_token(self, layer_span: LayerSpan) -> None:
         """Detach the span context unless the handler already did.
 
@@ -422,10 +461,17 @@ class AgentLayer:
         tracer: Any,
         handler: ExtendedTelemetryHandler,
         meter: Meter,
+        step_layer: Optional[ReactStepLayer] = None,
     ) -> None:
         self._tracer = tracer
         self.handler = handler
         self.metrics = AgentMetrics(meter)
+        #: The STEP spans this call's Reasoning-Acting rounds are recorded as.
+        self.step_layer = step_layer or ReactStepLayer(handler)
+
+    def react_step_tracker(self) -> Any:
+        """A tracker the ReAct round hooks of this call report into."""
+        return self.step_layer.tracker()
 
     def start_span(self, span_name: str) -> LayerSpan:
         return LayerSpan(self._tracer, span_name, SpanKind.INTERNAL).attach()

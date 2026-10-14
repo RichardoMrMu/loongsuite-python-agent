@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Third-review follow-ups on streaming and usage. The streamed text is read from
+  `LLMStreamEvent.text_delta` as well as from `text`, so a `0.1.0a2` stream
+  still lands in `au.llm.output` and in `gen_ai.output.messages`; the raw-usage
+  converter is resolved by capability, so a release whose `TokenUsage` has no
+  `from_anthropic` (`0.0.19.1`) still converts its provider usage; and a failure
+  in the per-chunk telemetry read stays inside the telemetry layer, so every
+  chunk reaches the caller unchanged and in the order it was produced.
+- `au.agent.output` carries the agent's answer instead of the framework's
+  `{**agent_input, "output": ...}` call envelope, a tool-planning round reports
+  its tool calls in `gen_ai.output.messages`, and a per-call `model=` override is
+  what `gen_ai.request.model` reports.
+- One STEP span per tool-calling round (`gen_ai.span.kind=STEP`,
+  `gen_ai.operation.name=react`, `gen_ai.react.round` counting from one,
+  `gen_ai.react.finish_reason`), with the round's token usage promoted onto the
+  agent span and an open step closed when the round aborts.
+- The baseline matrix follows the installed release for streamed usage instead of
+  assuming the doubling: `0.0.19.1` counts a streamed response onto its parent
+  twice, from `0.1.0a2` on once.
+
 ### Added
 
 - Initial release of `loongsuite-instrumentation-agentuniverse`: an independent

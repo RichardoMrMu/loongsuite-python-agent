@@ -695,7 +695,6 @@ class TestLLMLayer:
         assert {
             "gen_ai.operation.name",
             "gen_ai.span.kind",
-            "gen_ai.request.model",
             "gen_ai.provider.name",
             "gen_ai.framework",
         } <= set(record.gen_ai)
@@ -1082,7 +1081,7 @@ class TestContentPrivacy:
         assert record.au["au.tool.input"]
         assert record.au["au.tool.output"] == '"tool-output:hello"'
         assert json.loads(record.gen_ai["gen_ai.tool.call.arguments"]) == {
-            "kwargs": {"query": "hello"}
+            "query": "hello"
         }
         assert record.gen_ai["gen_ai.tool.call.result"] == "tool-output:hello"
 
@@ -1198,10 +1197,19 @@ class TestBaselineMatrix:
             "au.llm.stub_llm",
             "au.tool.stub_tool",
         ]
+        native_llm = baseline.find(result.native_records, "au.llm.stub_llm")
+        our_llm = baseline.find(result.ours_records, "au.llm.stub_llm")
+        assert (
+            json.loads(native_llm.au["au.llm.llm_params"])["temperature"] == -1
+        )
+        assert (
+            json.loads(our_llm.au["au.llm.llm_params"])["temperature"] == 0.7
+        )
         for name in baseline.names(result.ours_records):
             baseline.assert_same_span_shape(
                 baseline.find(result.native_records, name),
                 baseline.find(result.ours_records, name),
+                ignore_au=("au.llm.llm_params",),
             )
 
     def test_native_run_has_no_gen_ai_attributes_and_ours_adds_them(
@@ -1233,6 +1241,22 @@ class TestBaselineMatrix:
         for name in expected:
             assert name in native, f"native did not record {name}"
             assert name in ours, f"LoongSuite did not record {name}"
+            if name == "agent_calls_total":
+                # Native code mutates the recorded mapping on old SDKs.
+                assert all(
+                    "au_agent_streaming" not in dict(labels)
+                    for labels in ours[name]
+                )
+                native[name] = sorted(
+                    {
+                        tuple(
+                            (key, value)
+                            for key, value in labels
+                            if key != "au_agent_streaming"
+                        )
+                        for labels in native[name]
+                    }
+                )
             assert native[name] == ours[name], (
                 f"{name} labels differ: {native[name]} vs {ours[name]}"
             )

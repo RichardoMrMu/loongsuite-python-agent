@@ -127,10 +127,10 @@ class TestStableFrameworkUsageConversion:
         assert record.au["au.llm.usage.prompt_tokens"] == 20
         assert record.au["au.llm.usage.completion_tokens"] == 5
 
-    def test_usage_is_skipped_without_any_converter(
+    def test_raw_usage_does_not_depend_on_framework_converter(
         self, loongsuite_harness: Any, monkeypatch: Any
     ) -> None:
-        """No converter at all is a missing value, not a failed call."""
+        """Provider totals remain authoritative without an SDK converter."""
 
         class NoConverters:
             """A release that offers no converter at all."""
@@ -139,7 +139,7 @@ class TestStableFrameworkUsageConversion:
         result = RawProviderUsageLLM().call(prompt="hello")
         assert result.text == "raw:hello"
         record = one_layer_record(loongsuite_harness, LLM_SPAN)
-        assert "au.llm.usage.total_tokens" not in record.au
+        assert record.au["au.llm.usage.total_tokens"] == 25
 
 
 # ---------------------------------------------------------------------------

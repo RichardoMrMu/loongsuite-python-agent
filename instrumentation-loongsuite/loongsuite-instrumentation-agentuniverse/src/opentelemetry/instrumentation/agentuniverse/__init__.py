@@ -55,6 +55,7 @@ from ._common import (
     WRAPPER_GLOBAL_NAMES,
     describe_wrapper_owner,
 )
+from ._hooks import install_auxiliary_hooks, restore_auxiliary_hooks
 from ._llm import LLMLayer
 from ._step import (
     ReactStepLayer,
@@ -84,13 +85,14 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
     _snapshot: Dict[str, Any] = {}
     _wrappers: Dict[str, Any] = {}
     _hooks: Dict[str, Any] = {}
+    _auxiliary_hooks: list = []
     _owns_install = False
     #: Set when ``_instrument`` rolled back, so ``instrument`` can undo the
     #: instrumented mark ``BaseInstrumentor`` applies after it returns.
     _install_failed = False
 
     def instrumentation_dependencies(self) -> Sequence[str]:
-        return ("agentUniverse >= 0.0.19",)
+        return ("agentUniverse == 0.1.0a2",)
 
     # -- install ------------------------------------------------------
 
@@ -161,11 +163,19 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
             return
 
         installed: list[str] = []
+        hooks = {}
+        auxiliary_hooks = []
         try:
             for name, wrapper in wrappers.items():
-                self._install_wrapper(name, wrapper)
                 installed.append(name)
+                self._install_wrapper(name, wrapper)
+            hooks = install_react_step_hooks(step_layer)
+            if not hooks:
+                raise RuntimeError("Could not claim ReAct round hooks")
+            auxiliary_hooks = install_auxiliary_hooks()
         except Exception:
+            restore_auxiliary_hooks(auxiliary_hooks)
+            remove_react_step_hooks(hooks)
             self._rollback(snapshot, wrappers, installed)
             logger.warning(
                 "Installing the LoongSuite agentUniverse wrappers failed; "
@@ -175,22 +185,10 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
             self._install_failed = True
             return
 
-        # The ReAct round hooks are the only calls the tool-calling loop makes
-        # around every round, so the STEP spans hang off them. They are patched
-        # after the wrappers are in place and restored with them.
-        hooks = install_react_step_hooks(step_layer)
-        if not hooks:
-            self._rollback(snapshot, wrappers, installed)
-            logger.warning(
-                "Installing the LoongSuite agentUniverse round hooks failed; "
-                "rolled back to the original wrappers",
-            )
-            self._install_failed = True
-            return
-
         self._snapshot = snapshot
         self._wrappers = wrappers
         self._hooks = hooks
+        self._auxiliary_hooks = auxiliary_hooks
         self._owns_install = True
         _install_state.owner = self
 
@@ -293,6 +291,8 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
         self._owns_install = False
         self._snapshot = {}
         self._wrappers = {}
+        auxiliary_hooks, self._auxiliary_hooks = self._auxiliary_hooks, []
+        restore_auxiliary_hooks(auxiliary_hooks)
         hooks, self._hooks = self._hooks, {}
         if hooks:
             remove_react_step_hooks(hooks)

@@ -304,14 +304,26 @@ def install_react_step_hooks(layer: ReactStepLayer) -> Dict[str, Any]:
         )
         remove_react_step_hooks(originals)
         return {}
-    return originals
+    return {
+        name: (originals[name], wrapper)
+        for name, wrapper in (
+            ("on_before_llm_round", before),
+            ("on_after_llm_round", after),
+        )
+    }
 
 
 def remove_react_step_hooks(originals: Dict[str, Any]) -> None:
     """Restore the round hooks this package replaced."""
     for name in REACT_STEP_HOOKS:
-        original = originals.get(name)
-        if original is None:
+        saved = originals.get(name)
+        if saved is None:
+            continue
+        # Installation rollback also accepts the initial bare snapshot.
+        original, wrapper = (
+            saved if isinstance(saved, tuple) else (saved, None)
+        )
+        if wrapper is not None and getattr(Agent, name, None) is not wrapper:
             continue
         try:
             setattr(Agent, name, original)

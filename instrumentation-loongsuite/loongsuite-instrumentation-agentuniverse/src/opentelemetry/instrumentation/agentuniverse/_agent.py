@@ -49,6 +49,7 @@ from ._common import (
     LayerSpan,
     MetricLabels,
     NamePreservingSpan,
+    agent_name_attributes,
     build_safely,
     caller_labels,
     detach_context_token,
@@ -147,7 +148,8 @@ class AgentMetrics:
         )
 
     def record_call(self, labels: Dict[str, Any]) -> None:
-        self._calls.add(1, labels)
+        # Older SDKs retain the attribute mapping rather than copying it.
+        self._calls.add(1, dict(labels))
 
     def record_duration(self, duration: float, labels: Dict[str, Any]) -> None:
         self._duration.record(duration, labels)
@@ -252,8 +254,18 @@ class _AgentCall:
             MetricLabels.AGENT_STATUS: SUCCESS_STATUS,
         }
         self.layer_span: Optional[LayerSpan] = None
+        session_id = kwargs.get("session_id")
+        self.session_id = (
+            session_id
+            if isinstance(session_id, str) and session_id
+            else agent_name_attributes().get("gen_ai.session.id")
+        )
         self.invocation = InvokeAgentInvocation(
-            provider=FRAMEWORK_NAME, agent_name=self.source
+            provider=FRAMEWORK_NAME,
+            agent_name=self.source,
+            attributes={"gen_ai.session.id": self.session_id}
+            if self.session_id
+            else {},
         )
         self.streaming = False
         self.finished = False
@@ -484,7 +496,9 @@ class AgentLayer:
         agent_name_token = None
         try:
             run_safely(call.start, kwargs)
-            agent_name_token = push_current_agent_name(call.source)
+            agent_name_token = push_current_agent_name(
+                call.source, call.session_id
+            )
             result = func(*args, **kwargs)
         except BaseException as exc:
             error = exc
@@ -505,7 +519,9 @@ class AgentLayer:
         agent_name_token = None
         try:
             run_safely(call.start, kwargs)
-            agent_name_token = push_current_agent_name(call.source)
+            agent_name_token = push_current_agent_name(
+                call.source, call.session_id
+            )
             result = await func(*args, **kwargs)
         except BaseException as exc:
             error = exc

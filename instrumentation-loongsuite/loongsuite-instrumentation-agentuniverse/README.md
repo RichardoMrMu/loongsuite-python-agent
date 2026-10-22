@@ -12,7 +12,7 @@ of `agentuniverse.base.annotation.trace` -- the same seam the framework's own
 instrumentation uses -- and produces the Agent, LLM and Tool telemetry itself:
 
 * `au.agent.{source}`, `au.llm.{source}` and `au.tool.{source}` spans
-  (`SpanKind.INTERNAL`), with the same `au.*` attribute set, the same 26 metrics
+  (`SpanKind.INTERNAL`), with the `au.*` compatibility attributes and 26 metrics
   (9 agent, 9 LLM, 8 tool), streaming first-token timing, conversation-memory
   recording, invocation-chain propagation, token aggregation and error handling
   the framework's instrumentors emit, and
@@ -20,30 +20,33 @@ instrumentation uses -- and produces the Agent, LLM and Tool telemetry itself:
   spans, through the shared `ExtendedTelemetryHandler` every LoongSuite
   instrumentation uses.
 
-One agent call tree therefore carries exactly one span per layer -- agent, LLM
-request, tool call -- each with both the `au.*` and the `gen_ai.*` namespaces.
+One agent call tree carries one span per agent, LLM request and tool call,
+plus one STEP span for each native tool-calling round. The layer spans carry
+both the `au.*` and the `gen_ai.*` namespaces.
 
 ## Requirements
 
-The instrumentation itself is pure Python and runs on Python 3.10+. It needs
-the `agentUniverse` distribution to import, and agentUniverse 0.0.19 pins
-`numpy<2`, `grpcio==1.63.0` and `pyarrow<17`, none of which publish cp313
-wheels (numpy 1.x cannot build on 3.13 either). agentUniverse therefore
-installs on Python 3.10-3.12 today, and the LoongSuite test matrix mirrors
-that range.
+This first integration supports **agentUniverse 0.1.0a2 (experimental)** on
+Python 3.10-3.12. The exact version is intentional: its native tool-calling
+loop, round hooks and structured stream events are verified together.
 
-`requires-python` is bounded accordingly (`>=3.10,<3.13`), so the declared
-range, the classifiers and the tox environments all say the same thing. On
-3.13 the `instruments` extra cannot be resolved, and this instrumentation is
-inert without agentUniverse.
-
-`agentUniverse >= 0.0.19` is declared as the `instruments` extra.
+The stable 0.0.19.x releases are not supported by this integration. They lack
+the required round hooks, and their grpcio pin conflicts with the OpenTelemetry
+exporters required by the framework and this package. Installing with
+`--no-deps` or using `skip_dep_check=True` does not establish compatibility.
+Future framework versions need an explicit compatibility check before the
+supported range is widened. The framework's numpy/pyarrow dependencies also
+limit this matrix to Python 3.10-3.12.
 
 ## Installation
 
 ```bash
-pip install loongsuite-instrumentation-agentuniverse
+pip install "loongsuite-instrumentation-agentuniverse[instruments]"
 ```
+
+The `instruments` extra installs the supported prerelease explicitly. Installing
+the instrumentation without that extra leaves framework installation to the
+application; the runtime dependency check enforces the same version.
 
 ## Usage
 
@@ -111,7 +114,7 @@ total_tokens` from the same numbers the `au.*.usage.*` attributes carry,
 `gen_ai.response.time_to_first_token` for agent and LLM calls, the LLM's
 `gen_ai.response.finish_reasons`, the tool call carriers
 `gen_ai.tool.call.arguments` / `gen_ai.tool.call.result` and, with content
-capture on, the conventional `gen_ai.input.messages` /
+capture on, role-preserving `gen_ai.input.messages` /
 `gen_ai.output.messages` / `gen_ai.system_instructions`.
 
 The handler additionally records its own client metrics on those spans,
@@ -177,7 +180,7 @@ export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=SPAN_ONLY
 
 Capture is all-or-nothing per layer: either the input and the output are both
 on the span, or neither is. `EVENT_ONLY` counts as off for span content,
-because this instrumentation emits no events.
+while GenAI LLM events follow the shared handler and the application's log exporter configuration.
 
 Two attribute families need extra care, so they get the same treatment:
 
@@ -199,9 +202,15 @@ unconditionally: its attribute setters have no notion of the capture switch, so
 with content capture at its default `NO_CONTENT` a native-instrumented
 application still exports the raw prompt and the raw result. This package
 instead treats `NO_CONTENT` as a privacy guarantee for every span it produces.
-That is the first of the two deliberate differences below.
+This deliberate difference is covered in both the native baseline and complex runtime tests.
 
 ## Session propagation
+
+The explicit `session_id` on an Agent run is recorded as `gen_ai.session.id`
+on that Agent and its nested STEP, LLM and Tool spans. Native parallel tool
+workers use the `AgentContext` passed by the dispatcher, keeping sessions
+isolated without changing global providers or propagators.
+
 
 Session ID propagation (`au.trace.session.id`, `AUSessionPropagator`) is part of
 agentUniverse's telemetry setup, not of the instrumentation: it comes from
@@ -235,33 +244,24 @@ through this package leaves `trace.get_tracer_provider()` and
 
 ## Token usage
 
-`agentuniverse.llm.llm_output.TokenUsage` is a pydantic-v1 model whose real
-fields are `text_in`, `image_in`, `audio_in`, `cached_in`, `text_out`,
-`image_out`, `audio_out`, `cached_out` and `reasoning_out`; `prompt_tokens`,
-`completion_tokens`, `cached_tokens`, `reasoning_tokens` and `total_tokens`
-are read-only derived properties. Constructing
-`TokenUsage(prompt=3, completion=5, total=8)` therefore sets nothing at all
-(pydantic drops the unknown fields, leaving every counter zero) --
-`TokenUsage(text_in=3, text_out=5)` is the non-zero form.
+The framework's `TokenUsage` sums disjoint text, image, audio, cache and
+reasoning buckets. OpenAI-compatible provider usage instead includes cache
+reads in input totals and reasoning in output totals. This instrumentation
+observes the raw provider usage at conversion time and creates its own corrected
+bookkeeping value; it returns the original framework objects unchanged.
 
-Aggregation is verified end to end with a real `@trace_llm` method returning
-that usage: the LLM span carries `au.llm.usage.total_tokens=8`,
-`prompt_tokens=3`, `completion_tokens=5` plus the matching `gen_ai.usage.*`,
-and the same numbers appear on the parent agent span
-(`au.agent.usage.total_tokens=8`, ...) and in the `agent_tokens` metrics,
-recorded once.
+For provider usage of 20 input and 10 output tokens, with 5 cached input tokens
+and 3 reasoning output tokens, every LLM span records 20 / 10 / 30 rather than
+25 / 13 / 38. The same corrected totals reach Agent spans, the native metric
+families and the shared GenAI metrics. Cache reads remain a subset reported in
+`gen_ai.usage.cache_read.input_tokens`; reasoning remains a separate public
+message part and a native usage detail/metric. Usage-only stream tails replace
+cumulative snapshots instead of being added again.
 
-### A second intentional difference: streamed usage
-
-On the framework's streaming LLM path, the streamed usage is added to the LLM
-span's token entry twice -- once while the stream is consumed, once again when
-the stream is finalized -- so the parent agent span and the `agent_*_tokens`
-metrics receive double the real usage. That is an upstream double count.
-
-This implementation aggregates streamed usage exactly once. The baseline test
-pins both numbers against a real streamed call: the framework's parent sees
-20 tokens for a stream whose real usage is 10, LoongSuite's sees 10. The LLM
-span itself carries the real numbers on both paths.
+Direct user-created `TokenUsage` values without a provider payload retain their
+framework bucket semantics. No provider values are guessed from response text.
+The supported release already fixes an older framework stream aggregation bug;
+this implementation and its native baseline both aggregate each stream once.
 
 ## Divergence from the framework's own instrumentation
 
@@ -269,10 +269,11 @@ span itself carries the real numbers on both paths.
 | --- | --- | --- |
 | Span names, kinds, `au.*` attribute keys, metric names and labels | baseline | identical; a test compares a native run and a LoongSuite run of the same workload item by item |
 | Content capture | always writes `au.*` content | honours the capture switch; `NO_CONTENT` writes no content on any layer (intentional) |
-| Streamed LLM usage into the parent | double counted | counted once (intentional) |
+| Streamed LLM usage into the parent | counted once in 0.1.0a2 | counted once |
+| OpenAI cache/reasoning subsets | may be added to inclusive totals twice | corrected from the raw provider totals without mutating business results |
 | `au.*.error.message` | full traceback | `str(error)` when capture is on, the exception type when it is off |
-| `au.llm.llm_params` | whole mapping | whole mapping when capture is on, safe scalar parameters when it is off |
-| Session processor and propagator | registered by `TelemetryManager` | unchanged: not registered, not touched; works when the application registers them |
+| `au.llm.llm_params` | source helper may replace configured temperature with -1 | actual call/channel temperature, including zero; safe scalar parameters when capture is off |
+| Session processor and propagator | registered by `TelemetryManager` | globals unchanged; explicit Agent session ID is also mapped to GenAI attributes |
 
 ## Fail-safe telemetry
 
@@ -291,44 +292,36 @@ layer that cannot even be constructed calls the original function directly.
 | `_common.py` | shared span lifecycle, serialization, privacy, GenAI identity, token bookkeeping, metrics and fail-safe helpers |
 | `_agent.py` | the agent layer: span, attributes, nine metrics, streaming first token, memory, aggregation |
 | `_llm.py` | the LLM layer: span, attributes, nine metrics, deferred stream finalization, plugin hook, usage |
+| `_step.py` | native ReAct round spans |
+| `_hooks.py` | reversible provider conversion and native tool dispatcher hooks |
+| `_usage.py` | provider totals and call-local usage capture |
 | `_tool.py` | the tool layer: span, attributes, eight metrics, memory |
 
 ## Tests
 
-The suite runs against a real `agentUniverse` 0.0.19.1 install (Python 3.12)
-with no stand-in: 77 tests pass, one is skipped.
+The suite runs against the declared real framework version. Fast wrapper,
+coexistence, privacy, error and lifecycle checks are supplemented by
+`tests/runtime_app.py` and `tests/runtime_provider.py`:
 
-* **Baseline matrix.** The same workload is run twice -- once with the
-  framework's three instrumentors, once with this package -- and the two runs
-  are compared: span tree and parent relationships, span names, kinds and
-  status, the `au.*` key set and value semantics, all 26 metrics with their
-  labels and values -- the family sets are compared exactly, nine agent, nine
-  LLM and eight tool families, no family missing and none extra -- non-zero
-  token usage (`TokenUsage(text_in=3, text_out=5)`
-  reaching the agent span as 8 / 3 / 5), positive first-token durations, error
-  spans, and `ConversationMemoryModule` side effects. Dynamic values (durations,
-  pair ids, UUIDs) are compared by type and sign, not by value.
-* **Ownership and lifecycle.** Native-only, LoongSuite-only, all three native
-  instrumentors plus LoongSuite, and mixed setups; one span per layer in every
-  case; instrument/uninstrument order, double instrument, failed install
-  rollback, wrapper identity restoration, and native wrappers resuming work
-  after a restore.
-* **Behaviour.** Sync and async paths on all three layers, streaming agent and
-  LLM first-token timing (positive durations on the span and in the
-  `*_first_token_duration` histogram), stream finalization on completion,
-  error and early close, error status and error metrics, content capture in
-  both modes with a secret-scanning test that looks at every attribute value of
-  every span, and the `_llm_plugins` hook.
-* **Session.** The `TelemetryManager` path described above, in an isolated
-  process.
+- One native sync and two concurrent streaming conversations, each with two
+  user turns and three model decisions per turn.
+- Native parallel stock/price tools, followed by a multiplication tool, then
+  the final answer. Actual tool-call IDs, arguments, results and second-turn
+  history are verified in the OpenAI SDK requests and exported spans.
+- Nonempty synthetic public reasoning with `reasoning_effort=high`, fragmented
+  tool arguments and usage-only SSE tails. Only the provider HTTP boundary is
+  deterministic; SDK parsing, Agent loops, tool dispatch and telemetry are real.
+- `SPAN_ONLY` and `NO_CONTENT`, correct inclusive Token totals and metrics,
+  original business result identity, isolated sessions and parent trees.
+- Atomic installation failure/retry, later hook ownership, unread stream close,
+  cross-task consumption, cancellation, collector faults and clean siblings.
 
-Mutation checks confirm the tests are load-bearing. Neuter one seam, run the
-suite, and the tests that must notice go red: the agent, LLM or tool wrapper
-(29, 27 and 16 failures), the transactional takeover (32), rollback/restore
-(3), the privacy switch (9), stream finalization (7), token aggregation (6) and
-the session probe (1). Restoring the file turns the suite green again, with no
-failures left behind.
+Run from the repository root:
 
 ```bash
-python -m pytest tests -v
+tox -c tox-loongsuite.ini -e py312-test-loongsuite-instrumentation-agentuniverse
 ```
+
+The test matrix uses the exporters from the same pinned OpenTelemetry core
+revision as the SDK. Published exporters constrain released SDK versions and
+cannot be mixed with that development SDK.

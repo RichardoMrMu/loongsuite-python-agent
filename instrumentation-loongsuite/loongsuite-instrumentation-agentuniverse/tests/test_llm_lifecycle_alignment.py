@@ -88,14 +88,14 @@ class TestGenAiIdentity:
         assert record.au["au.llm.name"] == "modelling_llm"
         assert record.gen_ai["gen_ai.request.model"] == "gpt-4o"
 
-    def test_request_model_falls_back_to_the_component_name(
+    def test_unknown_model_is_not_replaced_with_component_name(
         self, loongsuite_harness: Any, monkeypatch: Any
     ) -> None:
         monkeypatch.delattr(StubLLM, "model_name", raising=False)
         with capture_on():
             StubLLM().call(prompt="hello")
         record = one_layer_record(loongsuite_harness, LLM_SPAN)
-        assert record.gen_ai["gen_ai.request.model"] == "stub_llm"
+        assert "gen_ai.request.model" not in record.gen_ai
 
     def test_provider_name_is_the_channel(
         self, loongsuite_harness: Any

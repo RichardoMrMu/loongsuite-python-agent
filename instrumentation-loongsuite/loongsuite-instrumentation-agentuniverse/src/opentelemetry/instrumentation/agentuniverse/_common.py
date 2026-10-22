@@ -50,11 +50,16 @@ from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
 )
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
+from opentelemetry.util.genai.extended_semconv.gen_ai_extended_attributes import (
+    GEN_AI_SESSION_ID,
+)
 from opentelemetry.util.genai.types import (
     InputMessage,
     OutputMessage,
+    Reasoning,
     Text,
     ToolCall,
+    ToolCallResponse,
 )
 from opentelemetry.util.genai.utils import (
     ContentCapturingMode,
@@ -381,6 +386,9 @@ class LayerSpan:
 
     def mark_gen_ai_identity(self) -> None:
         self.span.set_attribute(GEN_AI_FRAMEWORK, FRAMEWORK_NAME)
+        session_id = agent_name_attributes().get(GEN_AI_SESSION_ID)
+        if session_id:
+            self.span.set_attribute(GEN_AI_SESSION_ID, session_id)
 
     def end(self) -> None:
         if self.span.is_recording():
@@ -587,16 +595,76 @@ def assistant_message(
 
 
 def input_messages_for(payload: Any) -> list:
-    """Build GenAI input messages from a framework payload.
-
-    The payload is rendered the same way the ``au.*`` carriers render it, so
-    both namespaces show the same content when capture is enabled.
-    """
+    """Preserve public message roles, tool IDs and the actual user input."""
+    if isinstance(payload, dict):
+        nested = payload.get("kwargs")
+        values = nested if isinstance(nested, dict) else payload
+        for key in ("messages", "prompt", "input"):
+            if key in values:
+                return input_messages_for(values[key])
+        positional = payload.get("args")
+        if isinstance(positional, (list, tuple)) and positional:
+            return input_messages_for(positional[0])
+    if isinstance(payload, (list, tuple)):
+        messages = []
+        for message in payload:
+            role = message_field(message, "role") or message_field(
+                message, "type"
+            )
+            role = getattr(role, "value", role)
+            if role not in (
+                "user",
+                "assistant",
+                "system",
+                "developer",
+                "tool",
+            ):
+                continue
+            content = message_field(message, "content")
+            if role == "tool":
+                parts = [
+                    ToolCallResponse(
+                        response=content,
+                        id=message_field(message, "tool_call_id"),
+                    )
+                ]
+            else:
+                parts = content_parts(content)
+                reasoning = message_field(message, "reasoning_content")
+                if isinstance(reasoning, str) and reasoning:
+                    parts.insert(0, Reasoning(content=reasoning))
+                parts.extend(
+                    tool_call_parts(message_field(message, "tool_calls"))
+                )
+            messages.append(InputMessage(role=role, parts=parts))
+        return messages
     if isinstance(payload, str):
         text = payload
     else:
         text = safe_json_dumps(payload)
     return [user_message(text)] if text else []
+
+
+def message_field(message: Any, name: str) -> Any:
+    return (
+        message.get(name)
+        if isinstance(message, dict)
+        else getattr(message, name, None)
+    )
+
+
+def content_parts(content: Any) -> list:
+    if isinstance(content, str):
+        return [Text(content=content)] if content else []
+    if isinstance(content, list):
+        return [
+            Text(content=item["text"])
+            for item in content
+            if isinstance(item, dict)
+            and item.get("type") in ("text", "input_text", "output_text")
+            and isinstance(item.get("text"), str)
+        ]
+    return []
 
 
 def parse_tool_arguments(value: Any) -> Any:
@@ -666,7 +734,10 @@ def tool_call_parts(payload: Any) -> list:
 
 
 def output_messages_for(
-    payload: Any, finish_reason: str = "stop", tool_calls: Any = None
+    payload: Any,
+    finish_reason: str = "stop",
+    tool_calls: Any = None,
+    reasoning: Optional[str] = None,
 ) -> list:
     """The assistant message a layer reports for its own output.
 
@@ -674,6 +745,8 @@ def output_messages_for(
     the output, so ``tool_calls`` becomes a tool-call part of the same message.
     """
     parts: list = []
+    if isinstance(reasoning, str) and reasoning:
+        parts.append(Reasoning(content=reasoning))
     if payload is not None:
         text = (
             payload if isinstance(payload, str) else safe_json_dumps(payload)
@@ -708,17 +781,21 @@ def final_answer_of(result: Any) -> Any:
     return getattr(result, "output", result)
 
 
-_current_agent_name: ContextVar[Optional[str]] = ContextVar(
-    "agentuniverse_current_agent_name", default=None
+_current_agent_name: ContextVar[tuple] = ContextVar(
+    "agentuniverse_current_agent_name", default=(None, None)
 )
 
 
-def push_current_agent_name(name: Optional[str]) -> Optional[Token]:
+def push_current_agent_name(
+    name: Optional[str], session_id: Optional[str] = None
+) -> Optional[Token]:
     """Track the agent a nested LLM/tool call belongs to."""
     if not name:
         return None
     try:
-        return _current_agent_name.set(name)
+        if session_id is None:
+            session_id = _current_agent_name.get()[1]
+        return _current_agent_name.set((name, session_id))
     except Exception:  # pragma: no cover - defensive
         return None
 
@@ -734,8 +811,11 @@ def pop_current_agent_name(token: Optional[Token]) -> None:
 
 def agent_name_attributes() -> Dict[str, Any]:
     """``gen_ai.agent.name`` for a nested layer span, when there is one."""
-    name = _current_agent_name.get()
-    return {GenAI.GEN_AI_AGENT_NAME: name} if name else {}
+    name, session_id = _current_agent_name.get()
+    attributes = {GenAI.GEN_AI_AGENT_NAME: name} if name else {}
+    if session_id:
+        attributes[GEN_AI_SESSION_ID] = session_id
+    return attributes
 
 
 def push_invocation_chain(source: str, node_type: str) -> bool:

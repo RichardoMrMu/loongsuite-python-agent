@@ -39,7 +39,11 @@ from agentuniverse.llm.llm_output import LLMOutput, TokenUsage
 from opentelemetry.metrics import Meter
 from opentelemetry.trace import SpanKind
 from opentelemetry.util.genai.extended_handler import ExtendedTelemetryHandler
-from opentelemetry.util.genai.types import Error, LLMInvocation
+from opentelemetry.util.genai.types import (
+    Error,
+    FunctionToolDefinition,
+    LLMInvocation,
+)
 
 from ._common import (
     SUCCESS_STATUS,
@@ -68,53 +72,31 @@ from ._common import (
     set_usage_attributes,
     token_usage_for,
 )
+from ._usage import provider_usage, usage_call_context
 
 logger = logging.getLogger(__name__)
 
 SPAN_KIND_VALUE = "llm"
 
 
-def raw_usage_converter() -> Optional[Any]:
-    """The framework converter that can read a raw provider payload.
-
-    ``TokenUsage.from_anthropic`` only exists from 0.1.0a2 on, and the stable
-    releases are the ones the support matrix is built around, so the converter is
-    looked up one name at a time: an attribute that is not there must never be
-    read. ``from_openai`` stays the first choice because the payload is an
-    OpenAI-shaped one whenever both converters would accept it, which is the
-    order the framework's own LLM implementations use.
-    """
-    for name in ("from_openai", "from_anthropic"):
-        convert = getattr(TokenUsage, name, None)
-        if callable(convert):
-            return convert
-    return None
-
-
 def usage_of(result: Any) -> Optional[TokenUsage]:
-    """The token usage a call reported, from the result or from its raw payload.
-
-    The framework's LLM implementations fill ``LLMOutput.usage`` through
-    ``TokenUsage.from_openai``/``from_anthropic``, but a call that only carries
-    the provider payload in ``LLMOutput.raw`` -- which is what an OpenAI-style
-    service reporting usage outside the standard field looks like -- would
-    otherwise appear to have spent no tokens at all, leaving both the
-    ``au.*.usage.*`` attributes and the shared handler's ``gen_ai.usage.*``
-    empty. The payload is converted with the framework's own converters, so the
-    numbers agree with the framework instead of being re-derived here.
-    """
-    usage = getattr(result, "usage", None)
-    if usage:
-        return usage
+    """Prefer inclusive provider totals; never mutate SDK usage objects."""
     raw = getattr(result, "raw", None)
-    payload = raw.get("usage") if isinstance(raw, dict) else None
-    if not isinstance(payload, dict):
-        return None
-    convert = raw_usage_converter()
-    if convert is None:  # pragma: no cover - a framework without converters
-        return None
-    derived = convert(payload)
-    return derived if derived.total_tokens else None
+    if isinstance(raw, dict):
+        payload = raw.get("usage")
+        provider = (
+            "anthropic"
+            if isinstance(payload, dict)
+            and (
+                "cache_read_input_tokens" in payload
+                or "cache_creation_input_tokens" in payload
+            )
+            else "openai"
+        )
+        derived = provider_usage(payload, provider)
+        if derived is not None:
+            return derived
+    return getattr(result, "usage", None)
 
 
 def chunk_record(chunk: Any) -> tuple:
@@ -220,6 +202,48 @@ class ToolCallAccumulator:
         return [self._calls[index] for index in sorted(self._calls)]
 
 
+class ClaimedSyncStream:
+    """Finalize an explicitly closed stream even before its first iteration."""
+
+    def __init__(self, call, stream, original):
+        self._call = call
+        self._stream = stream
+        self._original = original
+        self._started = False
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._started = True
+        return next(self._stream)
+
+    def send(self, value):
+        self._started = True
+        return self._stream.send(value)
+
+    def throw(self, *args):
+        self._started = True
+        return self._stream.throw(*args)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close = getattr(self._original, "close", None)
+            if callable(close):
+                close()
+        finally:
+            try:
+                self._stream.close()
+            finally:
+                if not self._started:
+                    run_safely(self._call.finish_stream_success, "", None)
+                run_safely(self._call.finalize)
+
+
 class ClaimedAsyncStream:
     """The async twin of ``process_sync_stream``: claimed, then finalized once.
 
@@ -233,11 +257,16 @@ class ClaimedAsyncStream:
     """
 
     def __init__(
-        self, call: "_LLMCall", stream: AsyncGenerator[Any, None]
+        self,
+        call: "_LLMCall",
+        stream: AsyncGenerator[Any, None],
+        original: Any,
     ) -> None:
         self._call = call
         self._stream = stream
+        self._original = original
         self._started = False
+        self._closed = False
 
     def __aiter__(self) -> "ClaimedAsyncStream":
         return self
@@ -256,15 +285,20 @@ class ClaimedAsyncStream:
 
     async def aclose(self) -> None:
         """Stop the stream early; the span closes exactly once."""
+        if self._closed:
+            return
+        self._closed = True
         try:
-            await self._stream.aclose()
+            close = getattr(self._original, "aclose", None)
+            if callable(close):
+                await close()
         finally:
-            if not self._started:
-                # Nothing was read, so ``_async_stream`` never ran and its own
-                # finalizer never fired. Close the span with the empty output
-                # the caller actually got, like the sync twin does.
-                run_safely(self._call.finish_stream_success, "", None)
-            run_safely(self._call.finalize)
+            try:
+                await self._stream.aclose()
+            finally:
+                if not self._started:
+                    run_safely(self._call.finish_stream_success, "", None)
+                run_safely(self._call.finalize)
 
 
 def _apply_llm_plugins(func: Any) -> Any:
@@ -395,6 +429,9 @@ class _LLMCall:
         }
         self.layer_span: Optional[LayerSpan] = None
         self.streaming = False
+        self.provider_usage: Optional[TokenUsage] = None
+        self.reasoning_chunks: list[str] = []
+        self.stream_finish_reason: Optional[str] = None
         self.finished = False
         #: Only a node this call actually added may be popped again.
         self.invocation_chain_pushed = False
@@ -414,7 +451,11 @@ class _LLMCall:
         model really does go to that model. Telemetry has to report the model the
         call went to, not the one the component defaults to.
         """
-        for source in (self.kwargs, self.llm_input):
+        for source in (
+            self.kwargs,
+            self.llm_input.get("kwargs"),
+            self.llm_input,
+        ):
             if not isinstance(source, dict):
                 continue
             value = source.get("model")
@@ -433,17 +474,90 @@ class _LLMCall:
         override = self._call_model_override()
         if override:
             return override
-        model_name = getattr(self.llm_instance, "model_name", None)
+        channel = getattr(self.llm_instance, "_channel_instance", None)
+        model_name = (
+            getattr(channel, "channel_model_name", None)
+            or getattr(self.llm_instance, "channel_model_name", None)
+            or getattr(self.llm_instance, "model_name", None)
+        )
         if isinstance(model_name, str) and model_name:
             return model_name
-        return self.source
+        return None
 
     def _temperature(self) -> Optional[float]:
         """The configured temperature, ignoring the framework's -1 sentinel."""
-        temperature = (self.params or {}).get("temperature")
-        if temperature is None or temperature == -1:
-            return None
-        return temperature
+        channel = (
+            getattr(self.llm_instance, "_channel_instance", None)
+            or self.llm_instance
+        )
+        config = getattr(channel, "channel_model_config", None) or {}
+        nested = self.llm_input.get("kwargs") or {}
+        for values in (self.kwargs, nested, config):
+            if "temperature" in values:
+                temperature = values["temperature"]
+                return (
+                    temperature
+                    if isinstance(temperature, (int, float))
+                    and temperature != -1
+                    else None
+                )
+        temperature = getattr(self.llm_instance, "temperature", None)
+        return (
+            temperature
+            if isinstance(temperature, (int, float)) and temperature != -1
+            else None
+        )
+
+    def _refresh_request(self) -> None:
+        # A channel may be lazily initialized inside the first business call.
+        channel = (
+            getattr(self.llm_instance, "_channel_instance", None)
+            or self.llm_instance
+        )
+        provider = getattr(channel, "channel_name", None)
+        self.invocation.provider = (
+            provider if provider and provider != "default_channel" else None
+        )
+        self.invocation.request_model = self._request_model()
+        tools = (
+            self.kwargs.get("tools")
+            or (self.llm_input.get("kwargs") or {}).get("tools")
+            or []
+        )
+        self.invocation.tool_definitions = [
+            FunctionToolDefinition(
+                name=tool["function"]["name"],
+                description=tool["function"].get("description"),
+                parameters=tool["function"].get("parameters"),
+            )
+            for tool in tools
+            if isinstance(tool, dict)
+            and tool.get("type") == "function"
+            and isinstance(tool.get("function"), dict)
+            and isinstance(tool["function"].get("name"), str)
+        ]
+        self.invocation.temperature = self._temperature()
+        if self.invocation.temperature is not None:
+            self.params["temperature"] = self.invocation.temperature
+        if self.layer_span is not None:
+            self.layer_span.span.set_attribute(
+                LLMAttributes.LLM_PARAMS, llm_params_attribute(self.params)
+            )
+            if self.invocation.provider:
+                self.layer_span.span.set_attribute(
+                    LLMAttributes.CHANNEL_NAME, self.invocation.provider
+                )
+
+    def _collect_chunk_metadata(self, chunk: Any) -> None:
+        reasoning = getattr(chunk, "reasoning_delta", None)
+        if isinstance(reasoning, str) and reasoning:
+            self.reasoning_chunks.append(reasoning)
+        finish = getattr(chunk, "finish_reason", None)
+        if isinstance(finish, str) and finish:
+            self.stream_finish_reason = finish
+        identifier = getattr(chunk, "response_id", None)
+        if isinstance(identifier, str) and identifier:
+            self.invocation.response_id = identifier
 
     # -- lifecycle ----------------------------------------------------
 
@@ -471,15 +585,11 @@ class _LLMCall:
         )
         set_caller_attributes(span, self.caller_info)
         self.invocation.input_messages = self._input_messages()
+        self._refresh_request()
 
         run_safely(self._layer.metrics.record_call, self.labels)
 
     def _input_messages(self) -> list:
-        prompt = None
-        if isinstance(self.llm_input, dict):
-            prompt = self.llm_input.get("prompt")
-        if isinstance(prompt, str) and prompt:
-            return input_messages_for(prompt)
         return input_messages_for(self.llm_input)
 
     def mark_streaming(self) -> None:
@@ -517,7 +627,11 @@ class _LLMCall:
         span = self.layer_span.span
         span.set_attribute(LLMAttributes.STREAMING, False)
         duration = self.layer_span.elapsed()
-        usage = usage_of(result)
+        usage = self.provider_usage or usage_of(result)
+        self.invocation.response_id = getattr(result, "response_id", None)
+        raw = getattr(result, "raw", None)
+        if isinstance(raw, dict) and isinstance(raw.get("model"), str):
+            self.invocation.response_model_name = raw["model"]
 
         run_safely(
             Monitor.trace_llm_invocation,
@@ -557,6 +671,7 @@ class _LLMCall:
             usage,
             getattr(result, "finish_reason", None),
             tool_calls_of(result),
+            getattr(result, "reasoning_text", None),
         )
 
     def finish_stream_success(
@@ -574,6 +689,7 @@ class _LLMCall:
             return
         span = self.layer_span.span
         duration = self.layer_span.elapsed()
+        usage = self.provider_usage or usage
 
         run_safely(
             Monitor().trace_llm_invocation,
@@ -602,7 +718,13 @@ class _LLMCall:
         if usage:
             set_usage_attributes(span, LLMAttributes, usage)
 
-        self._set_invocation_success(output, usage, None, tool_calls)
+        self._set_invocation_success(
+            output,
+            usage,
+            self.stream_finish_reason,
+            tool_calls,
+            "".join(self.reasoning_chunks),
+        )
 
     def _set_invocation_success(
         self,
@@ -610,6 +732,7 @@ class _LLMCall:
         usage: Optional[TokenUsage],
         finish_reason: Optional[str] = None,
         tool_calls: Optional[list] = None,
+        reasoning: Optional[str] = None,
     ) -> None:
         """Hand the shared handler this call's output, calls included.
 
@@ -619,14 +742,15 @@ class _LLMCall:
         """
         reason = finish_reason or ("tool_calls" if tool_calls else "stop")
         self.invocation.output_messages = output_messages_for(
-            output, reason, tool_calls
+            output, reason, tool_calls, reasoning
         )
         self.invocation.finish_reasons = [reason]
-        if usage:
-            if usage.prompt_tokens:
-                self.invocation.input_tokens = usage.prompt_tokens
-            if usage.completion_tokens:
-                self.invocation.output_tokens = usage.completion_tokens
+        if usage is not None:
+            self.invocation.input_tokens = usage.prompt_tokens
+            self.invocation.output_tokens = usage.completion_tokens
+            if usage.cached_in:
+                self.invocation.usage_cache_read_input_tokens = usage.cached_in
+        self._refresh_request()
         self.layer_span.apply_timing(self.invocation)
 
     def finish_error(self, error: BaseException) -> None:
@@ -678,9 +802,9 @@ class _LLMCall:
 
     # -- streaming ----------------------------------------------------
 
-    def process_sync_stream(self, result: Any) -> Generator[Any, None, None]:
+    def process_sync_stream(self, result: Any) -> ClaimedSyncStream:
         self.mark_streaming()
-        return self._sync_stream(result)
+        return ClaimedSyncStream(self, self._sync_stream(result), result)
 
     def _sync_stream(self, result: Any) -> Generator[Any, None, None]:
         output: list[str] = []
@@ -689,7 +813,13 @@ class _LLMCall:
         error: Optional[BaseException] = None
         first = True
         try:
-            for chunk in result:
+            iterator = iter(result)
+            while True:
+                try:
+                    with usage_call_context(self):
+                        chunk = next(iterator)
+                except StopIteration:
+                    break
                 if first:
                     first = False
                     run_safely(self._finish_first_token)
@@ -706,6 +836,7 @@ class _LLMCall:
                 if chunk_usage:
                     usage = chunk_usage
                 run_safely(tool_calls.feed, chunk)
+                run_safely(self._collect_chunk_metadata, chunk)
                 yield chunk
         except GeneratorExit:
             # The caller stopped consuming the stream early: the span still
@@ -733,7 +864,7 @@ class _LLMCall:
         finalizes the span whenever consumption stops.
         """
         self.mark_streaming()
-        return ClaimedAsyncStream(self, self._async_stream(result))
+        return ClaimedAsyncStream(self, self._async_stream(result), result)
 
     async def _async_stream(self, result: Any) -> AsyncGenerator[Any, None]:
         output: list[str] = []
@@ -742,7 +873,13 @@ class _LLMCall:
         error: Optional[BaseException] = None
         first = True
         try:
-            async for chunk in result:
+            iterator = result.__aiter__()
+            while True:
+                try:
+                    with usage_call_context(self):
+                        chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    break
                 if first:
                     first = False
                     run_safely(self._finish_first_token)
@@ -757,6 +894,7 @@ class _LLMCall:
                 if chunk_usage:
                     usage = chunk_usage
                 run_safely(tool_calls.feed, chunk)
+                run_safely(self._collect_chunk_metadata, chunk)
                 yield chunk
         except GeneratorExit:
             # The caller stopped consuming the stream early: the span still
@@ -799,7 +937,8 @@ class LLMLayer:
             return _apply_llm_plugins(func)(*args, **kwargs)
         run_safely(call.start)
         try:
-            result = _apply_llm_plugins(func)(*args, **kwargs)
+            with usage_call_context(call):
+                result = _apply_llm_plugins(func)(*args, **kwargs)
         except BaseException as exc:
             run_safely(call.finish_error, exc)
             run_safely(call.finalize, exc)
@@ -810,7 +949,11 @@ class LLMLayer:
             return result
         if call.layer_span is None:
             return result
-        return call.process_sync_stream(result)
+        stream = run_safely(call.process_sync_stream, result)
+        if stream is None:
+            run_safely(call.finalize)
+            return result
+        return stream
 
     async def wrap_async(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         call = build_safely(_LLMCall, self, func, args, kwargs)
@@ -818,7 +961,8 @@ class LLMLayer:
             return await _apply_llm_plugins(func)(*args, **kwargs)
         run_safely(call.start)
         try:
-            result = await _apply_llm_plugins(func)(*args, **kwargs)
+            with usage_call_context(call):
+                result = await _apply_llm_plugins(func)(*args, **kwargs)
         except BaseException as exc:
             run_safely(call.finish_error, exc)
             run_safely(call.finalize, exc)
@@ -829,4 +973,8 @@ class LLMLayer:
             return result
         if call.layer_span is None:
             return result
-        return call.process_async_stream(result)
+        stream = run_safely(call.process_async_stream, result)
+        if stream is None:
+            run_safely(call.finalize)
+            return result
+        return stream

@@ -62,6 +62,7 @@ from ._common import (
     set_usage_attributes,
     token_usage_for,
 )
+from ._hooks import current_tool_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,7 @@ class _ToolCall:
         self.invocation = ExecuteToolInvocation(
             tool_name=self.source,
             tool_type=TOOL_TYPE,
-            tool_call_id=self.pair_id,
+            tool_call_id=current_tool_call_id(),
             attributes=agent_name_attributes(),
         )
 
@@ -242,7 +243,12 @@ class _ToolCall:
             span.set_attribute(ToolAttributes.OUTPUT, content)
         set_usage_attributes(span, ToolAttributes, usage)
 
-        self.invocation.tool_call_arguments = self.tool_input
+        arguments = self.tool_input.get("kwargs", self.tool_input)
+        self.invocation.tool_call_arguments = {
+            key: value
+            for key, value in arguments.items()
+            if key != "agent_context"
+        }
         self.invocation.tool_call_result = result
 
     def finish_error(self, error: BaseException) -> None:

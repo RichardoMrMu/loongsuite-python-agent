@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Limit initial support to agentUniverse 0.1.0a2 and make all wrapper/round-hook
+  installation failures atomic and retryable; preserve hooks replaced later.
+- Use provider-inclusive Token totals without double counting cache/reasoning
+  subsets; keep framework result objects unchanged and aggregate metrics once.
+- Preserve real tool-call IDs/arguments, message roles/history, public reasoning,
+  channel provider/model/temperature (including zero) and Agent final answers.
+- Carry explicit Agent session IDs into nested spans and native tool workers.
+- Finalize unread sync streams on close and preserve cancellation and context
+  restoration across tasks. Add complex native-loop SDK runtime regressions.
+
+
 - Third-review follow-ups on streaming and usage. The streamed text is read from
   `LLMStreamEvent.text_delta` as well as from `text`, so a `0.1.0a2` stream
   still lands in `au.llm.output` and in `gen_ai.output.messages`; the raw-usage
@@ -33,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release of `loongsuite-instrumentation-agentuniverse`: an independent
   OpenTelemetry instrumentation for the
   [agentUniverse](https://github.com/alipay/agentUniverse) multi-agent framework
-  (`agentUniverse >= 0.0.19`), aligned with the capabilities of the framework's
+  (`agentUniverse == 0.1.0a2`, experimental), aligned with the capabilities of the framework's
   own instrumentation but implemented from scratch, without importing,
   delegating to or patching any of its telemetry classes.
 - All three layers of an agent call tree are instrumented, one span per layer:

@@ -413,7 +413,7 @@ def monotonic_now() -> float:
     return time.monotonic()
 
 
-class NamePreservingSpan:
+class NamePreservingSpan(Span):
     """Keeps the framework-native span name while the shared handler finalizes.
 
     The shared GenAI handler normalises a span name to its own ``gen_ai`` form
@@ -431,6 +431,30 @@ class NamePreservingSpan:
 
     def update_name(self, name: str) -> None:
         """Drop the handler's name normalisation."""
+
+    def get_span_context(self):
+        return self._span.get_span_context()
+
+    def set_attribute(self, key, value):
+        return self._span.set_attribute(key, value)
+
+    def set_attributes(self, attributes):
+        return self._span.set_attributes(attributes)
+
+    def add_event(self, *args, **kwargs):
+        return self._span.add_event(*args, **kwargs)
+
+    def set_status(self, *args, **kwargs):
+        return self._span.set_status(*args, **kwargs)
+
+    def record_exception(self, *args, **kwargs):
+        return self._span.record_exception(*args, **kwargs)
+
+    def is_recording(self):
+        return self._span.is_recording()
+
+    def end(self, *args, **kwargs):
+        return self._span.end(*args, **kwargs)
 
     def __getattr__(self, item: str) -> Any:
         return getattr(self._span, item)

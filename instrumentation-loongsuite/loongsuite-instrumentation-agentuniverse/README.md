@@ -120,7 +120,8 @@ capture on, role-preserving `gen_ai.input.messages` /
 The handler additionally records its own client metrics on those spans,
 `gen_ai.client.operation.duration` and `gen_ai.client.token.usage`, next to the
 26 `au.*` metrics. The framework's own instrumentation has no equivalent of
-those two.
+those two. In event-enabled modes, the Span-compatible name proxy preserves
+the real trace/span IDs on the shared handler's LLM and Agent events.
 
 ## Coexistence with agentUniverse's own instrumentation
 

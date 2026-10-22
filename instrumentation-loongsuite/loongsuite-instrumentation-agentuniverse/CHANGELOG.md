@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep the name-preserving span proxy compatible with the OpenTelemetry Span
+  API so GenAI log events retain the actual trace/span IDs.
+
 - Limit initial support to agentUniverse 0.1.0a2 and make all wrapper/round-hook
   installation failures atomic and retryable; preserve hooks replaced later.
 - Use provider-inclusive Token totals without double counting cache/reasoning

@@ -27,10 +27,31 @@ from opentelemetry.instrumentation.agentuniverse._hooks import (
     current_tool_call_id,
 )
 from opentelemetry.instrumentation.agentuniverse._usage import _current_call
+from opentelemetry.trace import get_current_span, set_span_in_context
 
 from .conftest import NATIVE_WRAPPER_GLOBALS, StreamingLLM, StubLLM
 from .runtime_app import Workload
 from .runtime_provider import USAGE
+
+
+def test_name_proxy_preserves_otel_context_for_genai_events(
+    configured_providers,
+):
+    from opentelemetry.instrumentation.agentuniverse._common import (
+        NamePreservingSpan,
+    )
+
+    provider, _, _ = configured_providers
+    span = provider.get_tracer("test").start_span("native-name")
+    try:
+        proxy = NamePreservingSpan(span)
+        current = get_current_span(set_span_in_context(proxy))
+        assert current.get_span_context() == span.get_span_context()
+        assert current.get_span_context().is_valid
+        proxy.update_name("canonical-name")
+        assert span.name == "native-name"
+    finally:
+        span.end()
 
 
 def test_auxiliary_install_failure_restores_every_hook_and_allows_retry(

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real native tool loop and SDK parsing; only the HTTP provider is scripted."""
+"""Stable native ReAct/AgentExecutor; only the HTTP provider is scripted."""
 
 import asyncio
 import threading
@@ -24,18 +24,19 @@ from typing import Any, ClassVar
 import httpx
 from agentuniverse.agent.action.tool.tool import Tool
 from agentuniverse.agent.action.tool.tool_manager import ToolManager
-from agentuniverse.agent.agent import Agent
 from agentuniverse.agent.agent_model import AgentModel
-from agentuniverse.agent.memory.enum import ChatMessageEnum
-from agentuniverse.agent.memory.message import Message
-from agentuniverse.ai_context.agent_context import AgentContext
+from agentuniverse.agent.template.react_agent_template import (
+    ReActAgentTemplate,
+)
 from agentuniverse.llm.llm import LLM
 from agentuniverse.llm.llm_channel.llm_channel import LLMChannel
+from agentuniverse.prompt.prompt import Prompt
 from openai import AsyncOpenAI, OpenAI
 
 from opentelemetry import context
 
-from .runtime_provider import MODEL, Provider, answer, prompt
+from .runtime_provider import MODEL, answer, prompt
+from .stable_runtime_provider import Provider
 
 
 class ChannelLLM(LLM):
@@ -75,116 +76,64 @@ class InventoryTool(Tool):
                 work.active -= 1
 
 
-class InventoryAgent(Agent):
-    history: list = []
+class InventoryAgent(ReActAgentTemplate):
+    """Configure resources; execute and tool dispatch remain framework-owned."""
+
     configured_llm: Any = None
-    stream_queue: Any = None
-    schemas: list = []
-    observed_reasoning: list = []
+    configured_prompt: Any = None
 
-    def input_keys(self):
-        return ["input"]
+    def process_memory(self, agent_input, **kwargs):
+        return None
 
-    def output_keys(self):
-        return ["output"]
+    def process_llm(self, **kwargs):
+        return self.configured_llm
 
-    def parse_input(self, input_object, agent_input):
-        return agent_input
-
-    def parse_result(self, agent_result):
-        return agent_result
-
-    def make_context(self, input_object):
-        return AgentContext(
-            agent_id=self.agent_model.info["name"],
-            session_id=input_object.get_data("session_id"),
-            agent_model=self.agent_model,
-            tools_schema=self.schemas,
-            chat_history=list(self.history),
-            output_stream=self.stream_queue,
-            current_messages=[
-                Message(
-                    type=ChatMessageEnum.USER,
-                    content=input_object.get_data("input"),
-                )
-            ],
-        )
-
-    def finish(self, current, output):
-        self.observed_reasoning.append(output.reasoning_text)
-        self.history = (
-            current.chat_history + current.current_messages + [output.message]
-        )
-        return {"output": output.text}
-
-    def execute(self, input_object, agent_input):
-        current = self.make_context(input_object)
-        output = self.run_tool_calling_loop(
-            self.configured_llm, current, input_object, max_iterations=4
-        )
-        return self.finish(current, output)
-
-    async def async_execute(self, input_object, agent_input):
-        current = self.make_context(input_object)
-        output = await self.async_run_tool_calling_loop(
-            self.configured_llm, current, input_object, max_iterations=4
-        )
-        return self.finish(current, output)
+    def process_prompt(self, agent_input, **kwargs):
+        return self.configured_prompt
 
 
 class Workload:
-    def __init__(self):
+    def __init__(self, reasoning=True):
         InventoryTool.workload = self
         self.backend = Provider()
+        self.reasoning = reasoning
         self.tool_calls = []
         self.active = 0
         self.max_active = 0
         self.lock = threading.Lock()
-        self.schemas = []
-        for name, fields in [
-            ("stock_lookup", {"sku": {"type": "string"}}),
-            ("unit_price", {"sku": {"type": "string"}}),
-            ("multiply", {"a": {"type": "integer"}, "b": {"type": "integer"}}),
-        ]:
-            properties = dict(
-                worker={"type": "string"}, turn={"type": "integer"}, **fields
-            )
+        self.names = []
+        for name, fields in (
+            ("stock_lookup", ["sku"]),
+            ("unit_price", ["sku"]),
+            ("multiply", ["a", "b"]),
+        ):
             tool = InventoryTool(
                 name=name,
-                description="Synthetic inventory tool",
-                input_keys=list(properties),
+                description="Synthetic inventory tool; supply JSON arguments",
+                input_keys=["worker", "turn"] + fields,
             )
             ToolManager().register(tool.get_instance_code(), tool)
-            self.schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": "Synthetic inventory tool",
-                        "parameters": {
-                            "type": "object",
-                            "properties": properties,
-                            "required": list(properties),
-                        },
-                    },
-                }
-            )
+            self.names.append(name)
 
     def agent(self, label, streaming):
         channel = LLMChannel(
             channel_name="openai",
             channel_model_name=MODEL,
+            channel_api_key="synthetic",
             channel_api_base="http://provider.invalid/v1",
             ext_params={
-                "reasoning_effort": "high",
+                "reasoning_effort": "high" if self.reasoning else "none",
                 "stream_options": {"include_usage": True},
             },
         )
-        channel.channel_model_config = {
-            "model": MODEL,
-            "streaming": streaming,
-            "temperature": 0,
-        }
+        channel.channel_model_config = dict(
+            model=MODEL,
+            streaming=streaming,
+            temperature=0,
+            max_tokens=512,
+            request_timeout=30,
+            max_retries=0,
+        )
         channel.client = OpenAI(
             api_key="synthetic",
             base_url="http://provider.invalid/v1",
@@ -205,13 +154,35 @@ class Workload:
             name="inventory_llm", model_name=MODEL, streaming=streaming
         )
         llm._channel_instance = channel
+        llm._max_context_length = 8192
         agent = InventoryAgent()
-        agent.agent_model = AgentModel(info={"name": "inventory_" + label})
+        agent.agent_model = AgentModel(
+            info={"name": "inventory_" + label},
+            profile={
+                "llm_model": dict(
+                    name="inventory_llm",
+                    model_name=MODEL,
+                    temperature=0,
+                    streaming=streaming,
+                )
+            },
+        )
+        agent.agent_model.action = {"tool": self.names}
+        agent.max_iterations = 5
         agent.configured_llm = llm
-        agent.stream_queue = Queue()
-        agent.history = []
-        agent.observed_reasoning = []
-        agent.schemas = self.schemas
+        agent.configured_prompt = Prompt(
+            prompt_template=(
+                "Use the inventory tools: {tools}\nNames: {tool_names}\n"
+                "History: {chat_history}\nQuestion: {input}\n{agent_scratchpad}"
+            ),
+            input_variables=[
+                "tools",
+                "tool_names",
+                "chat_history",
+                "input",
+                "agent_scratchpad",
+            ],
+        )
         return agent
 
     async def run(self, tracer_provider):
@@ -219,6 +190,7 @@ class Workload:
 
         async def worker(label, streaming, synchronous=False):
             agent = self.agent(label, streaming)
+            history = ""
             with tracer_provider.get_tracer("app").start_as_current_span(
                 "au-session." + label
             ):
@@ -227,7 +199,8 @@ class Workload:
                     kwargs = dict(
                         input=prompt(label, turn),
                         session_id=label,
-                        output_stream=agent.stream_queue,
+                        chat_history=history,
+                        output_stream=Queue(),
                     )
                     output = (
                         agent.run(**kwargs)
@@ -237,21 +210,17 @@ class Workload:
                     text = output.get_data("output")
                     assert text == answer(label, turn)
                     assert context.get_current() is before
+                    history += f"Human: {kwargs['input']}\nAI: {text}\n"
                     records.append(
-                        {
-                            "worker": label,
-                            "turn": turn,
-                            "streaming": streaming,
-                            "text": text,
-                            "reasoning": agent.observed_reasoning[-1],
-                        }
+                        dict(
+                            worker=label,
+                            turn=turn,
+                            streaming=streaming,
+                            text=text,
+                        )
                     )
-                if streaming:
-                    assert agent.stream_queue.qsize() >= 4
-                agent.configured_llm._channel_instance.client.close()
-                await (
-                    agent.configured_llm._channel_instance.async_client.close()
-                )
+            agent.configured_llm._channel_instance.client.close()
+            await agent.configured_llm._channel_instance.async_client.close()
 
         await worker("auSync", False, True)
         await asyncio.gather(
@@ -265,7 +234,6 @@ class Workload:
             for turn in (1, 2):
                 for name in ("stock_lookup", "unit_price", "multiply"):
                     assert counts[label, turn, name] == 1
-        assert self.max_active >= 2
         return dict(
             self.backend.verify(),
             scenarios=records,

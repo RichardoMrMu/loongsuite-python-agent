@@ -260,7 +260,9 @@ class TestUsageAndChunkText:
         self, loongsuite_harness: Any
     ) -> None:
         """The real adapter's construction path, not a hand-built TokenUsage."""
+        import httpx
         from agentuniverse.llm.openai_style_llm import OpenAIStyleLLM
+        from openai import OpenAI
 
         from opentelemetry.instrumentation.agentuniverse._llm import (
             usage_of,
@@ -269,7 +271,11 @@ class TestUsageAndChunkText:
         completion = {
             "id": "chatcmpl-1",
             "choices": [
-                {"message": {"content": "hi"}, "finish_reason": "stop"}
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": "stop",
+                }
             ],
             "usage": {
                 "prompt_tokens": 20,
@@ -277,8 +283,24 @@ class TestUsageAndChunkText:
                 "total_tokens": 25,
             },
         }
-        adapter = OpenAIStyleLLM(name="adapter_llm")
-        result = adapter._build_llm_output_from_chat_completion(completion)
+        adapter = OpenAIStyleLLM(
+            name="adapter_llm",
+            model_name="synthetic-model",
+            api_base="http://provider.invalid/v1",
+        )
+        with OpenAI(
+            api_key="synthetic",
+            base_url="http://provider.invalid/v1",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, json=completion)
+                )
+            ),
+        ) as client:
+            adapter.client = client
+            result = adapter.call(
+                messages=[{"role": "user", "content": "hello"}]
+            )
         assert result.raw["usage"]["total_tokens"] == 25
         assert usage_of(result).total_tokens == 25
 

@@ -92,7 +92,7 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
     _install_failed = False
 
     def instrumentation_dependencies(self) -> Sequence[str]:
-        return ("agentUniverse == 0.1.0a2",)
+        return ("agentUniverse == 0.0.19.1",)
 
     # -- install ------------------------------------------------------
 
@@ -170,8 +170,6 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
                 installed.append(name)
                 self._install_wrapper(name, wrapper)
             hooks = install_react_step_hooks(step_layer)
-            if not hooks:
-                raise RuntimeError("Could not claim ReAct round hooks")
             auxiliary_hooks = install_auxiliary_hooks()
         except Exception:
             restore_auxiliary_hooks(auxiliary_hooks)

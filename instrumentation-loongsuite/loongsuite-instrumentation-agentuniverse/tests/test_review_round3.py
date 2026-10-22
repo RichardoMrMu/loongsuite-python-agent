@@ -29,15 +29,14 @@ import asyncio
 import json
 from typing import Any, AsyncIterator, List, Optional
 
+import pytest
 from agentuniverse.agent.agent_model import AgentModel
 from agentuniverse.base.annotation.trace import trace_llm
-from agentuniverse.llm.llm_output import (
-    LLMOutput,
-    LLMStreamEvent,
-    StreamReducer,
-    TokenUsage,
-    ToolCallDelta,
-)
+from agentuniverse.llm import llm_output as framework_outputs
+from agentuniverse.llm.llm_output import LLMOutput, TokenUsage
+
+LLMStreamEvent = getattr(framework_outputs, "LLMStreamEvent", None)
+StreamReducer = getattr(framework_outputs, "StreamReducer", None)
 
 from opentelemetry.instrumentation.agentuniverse import _llm as llm_layer
 
@@ -306,6 +305,9 @@ class StreamEventLLM(StubLLM):
         )
 
 
+@pytest.mark.skipif(
+    LLMStreamEvent is None, reason="Stable framework has no LLMStreamEvent API"
+)
 class TestStreamEventTextDelta:
     def test_text_delta_reaches_the_span_output(
         self, loongsuite_harness: Any
@@ -361,24 +363,30 @@ class ToolPlanningLLM(StubLLM):
                 usage=TokenUsage(text_in=2, text_out=3),
                 finish_reason="stop",
             )
-        reducer = StreamReducer()
-        reducer.feed(
-            LLMStreamEvent.tool_call(
-                ToolCallDelta(
-                    index=0,
-                    id="call-1",
-                    name="stub_tool",
-                    arguments_delta='{"query": ',
-                )
-            )
+        return LLMOutput(
+            text="",
+            raw={
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "stub_tool",
+                                        "arguments": '{"query": "hello"}',
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
         )
-        reducer.feed(
-            LLMStreamEvent.tool_call(
-                ToolCallDelta(index=0, arguments_delta='"hello"}')
-            )
-        )
-        reducer.feed(LLMStreamEvent.done(finish_reason="tool_calls"))
-        return reducer.build()
 
 
 class TestToolPlanningOutputMessages:
@@ -527,6 +535,10 @@ def build_loop_agent(name: str) -> Any:
     return agent
 
 
+@pytest.mark.skipif(
+    not hasattr(StubAgent, "run_tool_calling_loop"),
+    reason="Stable ReAct uses LangChain, without native round hook APIs",
+)
 class TestReactSteps:
     def test_each_round_gets_its_own_step_span(
         self, loongsuite_harness: Any

@@ -253,6 +253,11 @@ def install_react_step_hooks(layer: ReactStepLayer) -> Dict[str, Any]:
     anything that claimed them before) does around a round still happens, in the
     same order. Only the step span is added.
     """
+    # Stable 0.0.19.1 uses a LangChain ReAct executor, without these newer
+    # native round hooks. Their absence must not disable Agent/LLM/Tool spans.
+    # A partially present hook pair is still an invalid install and rolls back.
+    if not any(hasattr(Agent, name) for name in REACT_STEP_HOOKS):
+        return {}
     originals: Dict[str, Any] = {
         name: getattr(Agent, name) for name in REACT_STEP_HOOKS
     }
@@ -303,7 +308,7 @@ def install_react_step_hooks(layer: ReactStepLayer) -> Dict[str, Any]:
             exc_info=True,
         )
         remove_react_step_hooks(originals)
-        return {}
+        raise
     return {
         name: (originals[name], wrapper)
         for name, wrapper in (

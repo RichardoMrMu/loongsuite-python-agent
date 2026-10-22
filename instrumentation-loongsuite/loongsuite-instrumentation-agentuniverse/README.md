@@ -1,7 +1,7 @@
 # LoongSuite agentUniverse Instrumentation
 
 OpenTelemetry instrumentation for the
-[agentUniverse](https://github.com/alipay/agentUniverse) multi-agent framework
+[agentUniverse](https://github.com/agentuniverse-ai/agentUniverse) multi-agent framework
 (`agentUniverse`).
 
 This is an **independent implementation aligned with the capabilities of
@@ -20,33 +20,38 @@ instrumentation uses -- and produces the Agent, LLM and Tool telemetry itself:
   spans, through the shared `ExtendedTelemetryHandler` every LoongSuite
   instrumentation uses.
 
-One agent call tree carries one span per agent, LLM request and tool call,
-plus one STEP span for each native tool-calling round. The layer spans carry
+One agent call tree carries one span per agent, LLM request and tool call.
+Stable text ReAct uses the framework's LangChain executor; its Agent, LLM and
+Tool calls are recorded without requiring the alpha-only round hooks. The layer spans carry
 both the `au.*` and the `gen_ai.*` namespaces.
 
 ## Requirements
 
-This first integration supports **agentUniverse 0.1.0a2 (experimental)** on
-Python 3.10-3.12. The exact version is intentional: its native tool-calling
-loop, round hooks and structured stream events are verified together.
+The compatibility target is **agentUniverse 0.0.19.1**, Python 3.10-3.12.
+Agent/LLM/Tool wrappers, native text ReAct, OpenAI JSON/SSE responses and public
+reasoning use this stable release's actual APIs. Optional newer hooks do not
+prevent stable activation. The alpha release is not required.
 
-The stable 0.0.19.x releases are not supported by this integration. They lack
-the required round hooks, and their grpcio pin conflicts with the OpenTelemetry
-exporters required by the framework and this package. Installing with
-`--no-deps` or using `skip_dep_check=True` does not establish compatibility.
-Future framework versions need an explicit compatibility check before the
-supported range is widened. The framework's numpy/pyarrow dependencies also
-limit this matrix to Python 3.10-3.12.
+**Release blocker: the published 0.0.19.1 package cannot currently be installed
+with this integration's OpenTelemetry dependencies.** It requires
+`grpcio==1.63.0`, while the aligned OTel gRPC exporter requires
+`grpcio>=1.63.2`. The framework requires both the gRPC and HTTP exporter
+distributions, so choosing HTTP does not remove the dependency conflict.
+An upstream dependency correction and a new compatible stable package are
+required before normal installation can be accepted.
+
+Runtime diagnostic tests use unchanged stable framework source with a visibly
+versioned, metadata-only local dependency correction. This establishes API
+behavior, not compatibility of the unmodified published wheel. Neither
+`--no-deps` nor `skip_dep_check=True` is a supported installation workaround.
+The framework's numpy/pyarrow requirements limit this matrix to Python 3.10-3.12.
 
 ## Installation
 
-```bash
-pip install "loongsuite-instrumentation-agentuniverse[instruments]"
-```
-
-The `instruments` extra installs the supported prerelease explicitly. Installing
-the instrumentation without that extra leaves framework installation to the
-application; the runtime dependency check enforces the same version.
+Normal installation is blocked as described above. The `instruments` extra
+and runtime version check target `agentUniverse==0.0.19.1`; they do not silently
+select a prerelease. Do not treat this unreleased candidate as ready to install
+until the dependency blocker is resolved.
 
 ## Usage
 
@@ -208,9 +213,9 @@ This deliberate difference is covered in both the native baseline and complex ru
 ## Session propagation
 
 The explicit `session_id` on an Agent run is recorded as `gen_ai.session.id`
-on that Agent and its nested STEP, LLM and Tool spans. Native parallel tool
-workers use the `AgentContext` passed by the dispatcher, keeping sessions
-isolated without changing global providers or propagators.
+on that Agent and its nested LLM and Tool spans. This context remains isolated
+through the stable native ReAct executor and concurrent async conversations,
+without changing global providers or propagators.
 
 
 Session ID propagation (`au.trace.session.id`, `AUSessionPropagator`) is part of
@@ -261,8 +266,8 @@ cumulative snapshots instead of being added again.
 
 Direct user-created `TokenUsage` values without a provider payload retain their
 framework bucket semantics. No provider values are guessed from response text.
-The supported release already fixes an older framework stream aggregation bug;
-this implementation and its native baseline both aggregate each stream once.
+The stable framework's native instrumentation counts stream usage twice onto
+its parent. This integration aggregates each stream once.
 
 ## Divergence from the framework's own instrumentation
 
@@ -270,7 +275,7 @@ this implementation and its native baseline both aggregate each stream once.
 | --- | --- | --- |
 | Span names, kinds, `au.*` attribute keys, metric names and labels | baseline | identical; a test compares a native run and a LoongSuite run of the same workload item by item |
 | Content capture | always writes `au.*` content | honours the capture switch; `NO_CONTENT` writes no content on any layer (intentional) |
-| Streamed LLM usage into the parent | counted once in 0.1.0a2 | counted once |
+| Streamed LLM usage into the parent | counted twice in 0.0.19.1 | counted once |
 | OpenAI cache/reasoning subsets | may be added to inclusive totals twice | corrected from the raw provider totals without mutating business results |
 | `au.*.error.message` | full traceback | `str(error)` when capture is on, the exception type when it is off |
 | `au.llm.llm_params` | source helper may replace configured temperature with -1 | actual call/channel temperature, including zero; safe scalar parameters when capture is off |
@@ -302,16 +307,22 @@ layer that cannot even be constructed calls the original function directly.
 
 The suite runs against the declared real framework version. Fast wrapper,
 coexistence, privacy, error and lifecycle checks are supplemented by
-`tests/runtime_app.py` and `tests/runtime_provider.py`:
+`tests/runtime_app.py` and `tests/stable_runtime_provider.py`:
 
 - One native sync and two concurrent streaming conversations, each with two
-  user turns and three model decisions per turn.
-- Native parallel stock/price tools, followed by a multiplication tool, then
-  the final answer. Actual tool-call IDs, arguments, results and second-turn
-  history are verified in the OpenAI SDK requests and exported spans.
-- Nonempty synthetic public reasoning with `reasoning_effort=high`, fragmented
-  tool arguments and usage-only SSE tails. Only the provider HTTP boundary is
-  deterministic; SDK parsing, Agent loops, tool dispatch and telemetry are real.
+  user turns and four model decisions per turn.
+- The stable native ReAct/AgentExecutor dispatches stock, price and
+  multiplication tools, then produces the final answer. Arguments, actual
+  results and second-turn history are verified in real SDK traffic and spans.
+  Text ReAct does not supply provider tool-call IDs or parallel calls within
+  one model round; telemetry does not invent either capability.
+- Nonempty synthetic public reasoning with `reasoning_effort=high`, reasoning
+  disabled, fragmented text/reasoning and usage-only SSE tails. Only the
+  provider HTTP boundary is deterministic; SDK parsing, framework loops,
+  tool dispatch and telemetry are real.
+- Separate real stable-channel SDK calls verify raw tool-call JSON and
+  fragmented tool arguments in SSE. This checks model-output mapping, without
+  claiming that native text ReAct dispatch supplies provider tool-call IDs.
 - `SPAN_ONLY` and `NO_CONTENT`, correct inclusive Token totals and metrics,
   original business result identity, isolated sessions and parent trees.
 - Atomic installation failure/retry, later hook ownership, unread stream close,
@@ -325,4 +336,7 @@ tox -c tox-loongsuite.ini -e py312-test-loongsuite-instrumentation-agentuniverse
 
 The test matrix uses the exporters from the same pinned OpenTelemetry core
 revision as the SDK. Published exporters constrain released SDK versions and
-cannot be mixed with that development SDK.
+cannot be mixed with that development SDK. The normal tox installation remains
+blocked on the official framework dependency conflict; diagnostic runs are
+reported separately. Six alpha-API checks are inapplicable to the stable
+release and do not count as executed stable feature coverage.

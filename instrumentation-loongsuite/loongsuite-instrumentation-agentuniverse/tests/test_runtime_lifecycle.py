@@ -60,8 +60,8 @@ def test_auxiliary_install_failure_restores_every_hook_and_allows_retry(
     original = {
         name: getattr(trace_module, name) for name in NATIVE_WRAPPER_GLOBALS
     }
-    before = Agent.on_before_llm_round
-    after = Agent.on_after_llm_round
+    before = getattr(Agent, "on_before_llm_round", None)
+    after = getattr(Agent, "on_after_llm_round", None)
     install = instrumentation.install_auxiliary_hooks
 
     def fail():
@@ -71,8 +71,8 @@ def test_auxiliary_install_failure_restores_every_hook_and_allows_retry(
     instrumentor = instrumentation.AgentUniverseInstrumentor()
     instrumentor.instrument()
     assert not instrumentor.is_instrumented_by_opentelemetry
-    assert Agent.on_before_llm_round is before
-    assert Agent.on_after_llm_round is after
+    assert getattr(Agent, "on_before_llm_round", None) is before
+    assert getattr(Agent, "on_after_llm_round", None) is after
     assert all(
         getattr(trace_module, name) is value
         for name, value in original.items()
@@ -83,7 +83,6 @@ def test_auxiliary_install_failure_restores_every_hook_and_allows_retry(
 
 
 def test_uninstrument_preserves_later_hook_owners():
-    before = Agent.on_before_llm_round
     converter = inspect.getattr_static(TokenUsage, "from_openai")
     instrumentor = instrumentation.AgentUniverseInstrumentor()
     instrumentor.instrument()
@@ -93,16 +92,13 @@ def test_uninstrument_preserves_later_hook_owners():
 
     third_converter = classmethod(third_party)
     try:
-        Agent.on_before_llm_round = third_party
         TokenUsage.from_openai = third_converter
         instrumentor.uninstrument()
-        assert Agent.on_before_llm_round is third_party
         assert (
             inspect.getattr_static(TokenUsage, "from_openai")
             is third_converter
         )
     finally:
-        Agent.on_before_llm_round = before
         TokenUsage.from_openai = converter
 
 
@@ -196,12 +192,12 @@ def test_concurrent_collector_fault_keeps_business_and_clean_sibling(
     monkeypatch.setattr(_llm, "chunk_record", fail_once)
     before = context.get_current()
     result = asyncio.run(Workload().run(provider))
-    assert result["request_count"] == 18 and len(failures) == 1
+    assert result["request_count"] == 24 and len(failures) == 1
     assert context.get_current() is before
     assert _current_call.get() is None
     assert current_tool_call_id() is None
     StubLLM().call(prompt="clean sibling")
     assert context.get_current() is before
     spans = session_exporter.get_finished_spans()
-    assert len(spans) == 64
+    assert len(spans) == 52
     assert spans[-1].parent is None

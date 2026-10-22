@@ -114,7 +114,9 @@ def install_auxiliary_hooks():
             ("from_openai", "openai"),
             ("from_anthropic", "anthropic"),
         ):
-            original = inspect.getattr_static(TokenUsage, name)
+            original = inspect.getattr_static(TokenUsage, name, None)
+            if original is None:
+                continue
             if not isinstance(original, classmethod):
                 raise TypeError("Unsupported TokenUsage converter")
             wrapper = _usage_hook(original, provider)
@@ -124,7 +126,9 @@ def install_auxiliary_hooks():
             ("execute_tool_call", False),
             ("async_execute_tool_call", True),
         ):
-            original = inspect.getattr_static(Agent, name)
+            original = inspect.getattr_static(Agent, name, None)
+            if original is None:
+                continue
             wrapper = _dispatch_hook(original, asynchronous)
             hooks.append((Agent, name, original, wrapper))
             setattr(Agent, name, wrapper)

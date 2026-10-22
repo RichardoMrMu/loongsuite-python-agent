@@ -128,6 +128,21 @@ def chunk_text(chunk: Any) -> str:
     return chunk_record(chunk)[0]
 
 
+def raw_choice(result: Any) -> dict:
+    """The first public OpenAI choice retained by stable LLMOutput.raw."""
+    raw = getattr(result, "raw", None)
+    choices = raw.get("choices") if isinstance(raw, dict) else None
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        return choices[0]
+    return {}
+
+
+def raw_message(result: Any) -> dict:
+    choice = raw_choice(result)
+    message = choice.get("delta") or choice.get("message")
+    return message if isinstance(message, dict) else {}
+
+
 def tool_calls_of(result: Any) -> list:
     """The tool calls an LLM result asked for, from either framework shape.
 
@@ -146,7 +161,7 @@ def tool_calls_of(result: Any) -> list:
     message = getattr(result, "message", None)
     if isinstance(message, dict) and message.get("tool_calls"):
         return list(message["tool_calls"])
-    return []
+    return list(raw_message(result).get("tool_calls") or [])
 
 
 def _streamed_tool_call_deltas(chunk: Any) -> list:
@@ -160,7 +175,7 @@ def _streamed_tool_call_deltas(chunk: Any) -> list:
     message = getattr(chunk, "message", None)
     if isinstance(message, dict) and message.get("tool_calls"):
         return list(message["tool_calls"])
-    return []
+    return list(raw_message(chunk).get("tool_calls") or [])
 
 
 class ToolCallAccumulator:
@@ -186,6 +201,10 @@ class ToolCallAccumulator:
                 identifier = delta.get("id", identifier)
                 name = delta.get("name", name)
                 fragment = delta.get("arguments_delta", fragment)
+                function = delta.get("function")
+                if isinstance(function, dict):
+                    name = function.get("name", name)
+                    fragment = function.get("arguments", fragment)
             if not isinstance(index, int):
                 index = len(self._calls) if index is None else position
             call = self._calls.setdefault(
@@ -549,15 +568,23 @@ class _LLMCall:
                 )
 
     def _collect_chunk_metadata(self, chunk: Any) -> None:
-        reasoning = getattr(chunk, "reasoning_delta", None)
+        raw = getattr(chunk, "raw", None)
+        raw = raw if isinstance(raw, dict) else {}
+        reasoning = getattr(chunk, "reasoning_delta", None) or raw_message(
+            chunk
+        ).get("reasoning_content")
         if isinstance(reasoning, str) and reasoning:
             self.reasoning_chunks.append(reasoning)
-        finish = getattr(chunk, "finish_reason", None)
+        finish = getattr(chunk, "finish_reason", None) or raw_choice(
+            chunk
+        ).get("finish_reason")
         if isinstance(finish, str) and finish:
             self.stream_finish_reason = finish
-        identifier = getattr(chunk, "response_id", None)
+        identifier = getattr(chunk, "response_id", None) or raw.get("id")
         if isinstance(identifier, str) and identifier:
             self.invocation.response_id = identifier
+        if isinstance(raw.get("model"), str):
+            self.invocation.response_model_name = raw["model"]
 
     # -- lifecycle ----------------------------------------------------
 
@@ -628,8 +655,10 @@ class _LLMCall:
         span.set_attribute(LLMAttributes.STREAMING, False)
         duration = self.layer_span.elapsed()
         usage = self.provider_usage or usage_of(result)
-        self.invocation.response_id = getattr(result, "response_id", None)
         raw = getattr(result, "raw", None)
+        self.invocation.response_id = getattr(result, "response_id", None) or (
+            raw.get("id") if isinstance(raw, dict) else None
+        )
         if isinstance(raw, dict) and isinstance(raw.get("model"), str):
             self.invocation.response_model_name = raw["model"]
 
@@ -669,9 +698,11 @@ class _LLMCall:
         self._set_invocation_success(
             result.text,
             usage,
-            getattr(result, "finish_reason", None),
+            getattr(result, "finish_reason", None)
+            or raw_choice(result).get("finish_reason"),
             tool_calls_of(result),
-            getattr(result, "reasoning_text", None),
+            getattr(result, "reasoning_text", None)
+            or raw_message(result).get("reasoning_content"),
         )
 
     def finish_stream_success(

@@ -24,6 +24,7 @@ No agentUniverse OTel class is imported or called here.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, Optional
 
@@ -244,6 +245,21 @@ class _ToolCall:
         set_usage_attributes(span, ToolAttributes, usage)
 
         arguments = self.tool_input.get("kwargs", self.tool_input)
+        positional = self.tool_input.get("args")
+        # Stable native ReAct calls Tool.langchain_run with one JSON string;
+        # it is the actual tool input, whereas its kwargs contain no arguments.
+        if (
+            not arguments
+            and isinstance(positional, (tuple, list))
+            and len(positional) == 1
+            and isinstance(positional[0], str)
+        ):
+            try:
+                decoded = json.loads(positional[0])
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, dict):
+                arguments = decoded
         self.invocation.tool_call_arguments = {
             key: value
             for key, value in arguments.items()

@@ -92,7 +92,7 @@ class AgentUniverseInstrumentor(BaseInstrumentor):
     _install_failed = False
 
     def instrumentation_dependencies(self) -> Sequence[str]:
-        return ("agentUniverse == 0.0.19.1",)
+        return ("agentUniverse >= 0.0.19.1",)
 
     # -- install ------------------------------------------------------
 

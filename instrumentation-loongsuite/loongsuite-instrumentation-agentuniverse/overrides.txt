@@ -1,0 +1,5 @@
+# agentUniverse 0.0.19.1 pins grpcio==1.63.0 exactly, while the pinned
+# opentelemetry-exporter-otlp-proto-grpc from the core repo SHA requires
+# grpcio>=1.63.2 on Python <3.13. The two are otherwise ABI-compatible patch
+# releases; override the transitive floor so the resolver can install.
+grpcio==1.63.0

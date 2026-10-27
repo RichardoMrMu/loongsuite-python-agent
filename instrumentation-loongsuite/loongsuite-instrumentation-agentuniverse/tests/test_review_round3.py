@@ -365,6 +365,8 @@ class ToolPlanningLLM(StubLLM):
             )
         return LLMOutput(
             text="",
+            message=_tool_planning_message(),
+            finish_reason="tool_calls",
             raw={
                 "choices": [
                     {
@@ -387,6 +389,31 @@ class ToolPlanningLLM(StubLLM):
                 ],
             },
         )
+
+
+def _tool_planning_message():
+    """Assistant message carrying a tool call, for SDKs that ship the
+    native tool-calling loop (0.1.0a2+). Older agentUniverse has no
+    ``ToolCall`` surface; on those the round is driven through ``raw`` and
+    the loop tests are skipped via the ``run_tool_calling_loop`` gate.
+    """
+    ToolCall = getattr(framework_outputs, "ToolCall", None)
+    Message = getattr(framework_outputs, "Message", None)
+    ChatMessageEnum = getattr(framework_outputs, "ChatMessageEnum", None)
+    if ToolCall is None or Message is None:
+        return None
+    tool_call = ToolCall(
+        id="call-1",
+        type="function",
+        function={"name": "stub_tool", "arguments": '{"query": "hello"}'},
+    )
+    role = (
+        getattr(ChatMessageEnum, "ASSISTANT", "assistant")
+        if ChatMessageEnum
+        else "assistant"
+    )
+    return Message(type=role, content="", tool_calls=[tool_call])
+
 
 
 class TestToolPlanningOutputMessages:
@@ -529,7 +556,23 @@ def build_round_agent(
     return agent
 
 
+def _ensure_stub_tool_registered() -> None:
+    """Register the real ``stub_tool`` so the native loop's
+    ``execute_tool_call`` dispatches to a successful tool, not a
+    not-found error path."""
+    from agentuniverse.agent.action.tool.tool_manager import ToolManager
+
+    from .conftest import StubTool
+
+    manager = ToolManager()
+    probe = StubTool()
+    code = probe.get_instance_code()
+    if code not in manager._instance_obj_map:
+        manager.register(code, StubTool())
+
+
 def build_loop_agent(name: str) -> Any:
+    _ensure_stub_tool_registered()
     agent = ToolCallingLoopAgent()
     agent.agent_model = AgentModel(info={"name": name})
     return agent

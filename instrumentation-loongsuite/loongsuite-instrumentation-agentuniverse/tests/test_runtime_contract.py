@@ -26,6 +26,10 @@ from opentelemetry.instrumentation.agentuniverse import (
     AgentUniverseInstrumentor,
 )
 
+from opentelemetry.instrumentation.agentuniverse._step import (
+    REACT_STEP_HOOKS,
+)
+
 from .baseline import collect_metrics, counter_value
 from .conftest import NATIVE_WRAPPER_GLOBALS
 from .runtime_app import Workload
@@ -33,9 +37,22 @@ from .runtime_provider import MODEL, prompt
 from .runtime_provider import Provider as ToolProvider
 
 
+def _stream_event_usage(chunk):
+    """Read token usage from a stream chunk across SDK layouts.
+
+    stable 0.0.19.1 yields raw OpenAI chunk dicts on ``chunk.raw``; alpha
+    0.1.0a2 yields LLMStreamEvent objects that carry a typed ``usage`` and no
+    ``raw`` attribute. Both must still prove at least one usage-bearing chunk.
+    """
+    raw = getattr(chunk, "raw", None)
+    if isinstance(raw, dict):
+        return raw.get("usage")
+    return getattr(chunk, "usage", None)
+
+
 def test_stable_without_native_round_hooks_enables_all_core_wrappers():
-    assert not hasattr(Agent, "on_before_llm_round")
-    assert not hasattr(Agent, "on_after_llm_round")
+    # stable 0.0.19.1 ships no native round hooks; alpha ships them natively.
+    had_native_hooks = any(hasattr(Agent, name) for name in REACT_STEP_HOOKS)
     original = {
         name: getattr(trace_module, name) for name in NATIVE_WRAPPER_GLOBALS
     }
@@ -51,7 +68,12 @@ def test_stable_without_native_round_hooks_enables_all_core_wrappers():
         getattr(trace_module, name) is value
         for name, value in original.items()
     )
-    assert not hasattr(Agent, "on_before_llm_round")
+    if had_native_hooks:
+        # alpha: our wrappers must be removed, the native hooks restored.
+        assert all(hasattr(Agent, name) for name in REACT_STEP_HOOKS)
+    else:
+        # stable: no native round hooks and still none after uninstall.
+        assert not any(hasattr(Agent, name) for name in REACT_STEP_HOOKS)
 
 
 def test_partial_round_hook_install_is_atomic(monkeypatch):
@@ -105,7 +127,7 @@ def test_stable_sdk_raw_tool_calls_and_fragments(
         )
         if streaming:
             chunks = list(result)
-            assert any(chunk.raw.get("usage") for chunk in chunks)
+            assert any(_stream_event_usage(c) for c in chunks)
         else:
             assert result.raw["choices"][0]["message"]["tool_calls"]
     spans = loongsuite_harness.spans()

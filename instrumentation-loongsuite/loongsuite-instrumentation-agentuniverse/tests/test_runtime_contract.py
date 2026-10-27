@@ -25,7 +25,6 @@ from openai import OpenAI
 from opentelemetry.instrumentation.agentuniverse import (
     AgentUniverseInstrumentor,
 )
-
 from opentelemetry.instrumentation.agentuniverse._step import (
     REACT_STEP_HOOKS,
 )

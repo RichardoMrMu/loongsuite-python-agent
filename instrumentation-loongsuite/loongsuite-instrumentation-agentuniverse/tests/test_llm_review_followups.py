@@ -301,7 +301,10 @@ class TestUsageAndChunkText:
                 )
             ),
         ) as client:
-            adapter.client = client
+            if hasattr(type(adapter), "_get_client"):
+                adapter._get_client = lambda api_base=None: client
+            else:
+                adapter.client = client
             result = adapter.call(
                 messages=[{"role": "user", "content": "hello"}]
             )

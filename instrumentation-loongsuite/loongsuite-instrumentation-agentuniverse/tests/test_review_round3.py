@@ -415,7 +415,6 @@ def _tool_planning_message():
     return Message(type=role, content="", tool_calls=[tool_call])
 
 
-
 class TestToolPlanningOutputMessages:
     def test_a_tool_call_round_reports_its_calls(
         self, loongsuite_harness: Any
